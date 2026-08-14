@@ -71,6 +71,7 @@ interface ApplyPayload {
   universityName?: string;
   website?: string;
   linkedinUrl?: string;
+  githubUsername?: string;
   buildingDescription?: string;
   promoCode?: string;
   turnstileToken?: string;
@@ -378,6 +379,9 @@ async function createNotionPage(
       : undefined,
     Website: payload.website ? { url: payload.website } : undefined,
     LinkedIn: payload.linkedinUrl ? { url: payload.linkedinUrl } : undefined,
+    'GitHub Username': payload.githubUsername
+      ? { rich_text: [{ text: { content: payload.githubUsername } }] }
+      : undefined,
     'Eligibility Tier': { select: { name: tierLabel(pricing.eligibilityId) } },
     'Base Price': { number: pricing.originalPrice },
     'Discount %': { number: pricing.discount / 100 },
