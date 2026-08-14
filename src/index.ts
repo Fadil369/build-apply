@@ -16,6 +16,7 @@ export interface Env {
   ADMIN_TOKEN?: string;
   HUB_URL?: string;
   HUB_KEY?: string;
+  GITHUB_TOKEN?: string;
 }
 
 interface KvTask {
@@ -594,6 +595,62 @@ const MILESTONE_TEMPLATE: { name: string; automation: 'Auto' | 'Manual'; day: nu
   { name: '🏗️ المشروع الختامي — المنظومة المتكاملة', automation: 'Auto', day: 15 },
 ];
 
+const GITHUB_TEMPLATE_OWNER = 'Fadil369';
+const GITHUB_TEMPLATE_REPO = 'brainsait-build-starter';
+
+/**
+ * Give a paid candidate a real, isolated GitHub repo generated from the BUILD
+ * starter template, with them invited as an outside collaborator scoped to
+ * that one repo only — never org-wide. Idempotent via KV. No-ops silently
+ * when no GitHub username is on file (the intake flow doesn't collect one
+ * yet — this activates on its own once that field exists on the candidate).
+ */
+async function provisionGitHubAccess(env: Env, applicationRef: string, githubUsername?: string): Promise<void> {
+  if (!env.GITHUB_TOKEN || !githubUsername) return;
+
+  const dedupKey = `github-provisioned:${applicationRef}`;
+  if (env.APPLICATIONS && (await env.APPLICATIONS.get(dedupKey))) return;
+
+  const repoName = `build-${applicationRef.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 60)}`;
+  const ghHeaders = {
+    Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'Content-Type': 'application/json',
+    'User-Agent': 'brainsait-build-apply',
+  };
+
+  const createRes = await fetch(
+    `https://api.github.com/repos/${GITHUB_TEMPLATE_OWNER}/${GITHUB_TEMPLATE_REPO}/generate`,
+    {
+      method: 'POST',
+      headers: ghHeaders,
+      body: JSON.stringify({ owner: GITHUB_TEMPLATE_OWNER, name: repoName, private: false, include_all_branches: false }),
+    },
+  );
+  if (!createRes.ok) {
+    console.error(`GitHub repo generate failed for ${applicationRef}: ${createRes.status} ${await createRes.text()}`);
+    return;
+  }
+  const repo = (await createRes.json()) as { html_url: string; full_name: string };
+
+  const inviteRes = await fetch(
+    `https://api.github.com/repos/${repo.full_name}/collaborators/${encodeURIComponent(githubUsername)}`,
+    { method: 'PUT', headers: ghHeaders, body: JSON.stringify({ permission: 'push' }) },
+  );
+  if (!inviteRes.ok) {
+    console.error(`GitHub collaborator invite failed for ${applicationRef} -> ${githubUsername}: ${inviteRes.status}`);
+    // Repo exists even if the invite failed; still record it so we don't re-create on retry.
+  }
+
+  if (env.APPLICATIONS) {
+    await env.APPLICATIONS.put(
+      dedupKey,
+      JSON.stringify({ repoUrl: repo.html_url, githubUsername, provisionedAt: new Date().toISOString() }),
+    );
+  }
+}
+
 async function milestoneExists(env: Env, candidateId: string, name: string): Promise<boolean> {
   try {
     const data = await notionRequest(env, 'POST', `/databases/${env.NOTION_MILESTONES_DB_ID}/query`, {
@@ -924,6 +981,15 @@ async function handleShopifyWebhook(request: Request, env: Env): Promise<Respons
 
   // Certificate may already be issuable (e.g. milestones seeded earlier).
   try { await checkAndIssueCertificate(env, candidate, appRef); } catch { /* best-effort */ }
+
+  // Real, isolated GitHub repo per paid candidate — Phase 1 of the BUILD
+  // access model. No-ops until a "GitHub Username" field exists on the
+  // candidate; see BUILD Access Architecture for why this is the one
+  // Tier-1 item that's actually provisionable via API today.
+  try {
+    const githubUsername = candidate?.properties?.['GitHub Username']?.rich_text?.[0]?.plain_text;
+    await provisionGitHubAccess(env, appRef, githubUsername);
+  } catch { /* best-effort */ }
 
   await emitHubEvent(env, {
     type: 'build.paid',

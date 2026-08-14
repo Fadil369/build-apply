@@ -39,3 +39,7 @@ enabled = true
 # ADMIN_TOKEN (optional, guards /admin/stats)
 # HUB_URL (defaults to https://brainsait.de)
 # HUB_KEY (optional)
+# GITHUB_TOKEN (optional — enables Phase 1 BUILD access provisioning: generates
+#   a repo from Fadil369/brainsait-build-starter per paid candidate and invites
+#   them as a repo-scoped collaborator. No-ops until a "GitHub Username" field
+#   exists on the Notion candidate record. Token scope needed: repo.)
