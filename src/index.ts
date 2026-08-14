@@ -610,10 +610,17 @@ const GITHUB_TEMPLATE_REPO = 'brainsait-build-starter';
  * yet — this activates on its own once that field exists on the candidate).
  */
 async function provisionGitHubAccess(env: Env, applicationRef: string, githubUsername?: string): Promise<void> {
-  if (!env.GITHUB_TOKEN || !githubUsername) return;
+  console.log(`provisionGitHubAccess called: ref=${applicationRef} username=${githubUsername || '(none)'} hasToken=${!!env.GITHUB_TOKEN}`);
+  if (!env.GITHUB_TOKEN || !githubUsername) {
+    console.log('provisionGitHubAccess: early return, missing token or username');
+    return;
+  }
 
   const dedupKey = `github-provisioned:${applicationRef}`;
-  if (env.APPLICATIONS && (await env.APPLICATIONS.get(dedupKey))) return;
+  if (env.APPLICATIONS && (await env.APPLICATIONS.get(dedupKey))) {
+    console.log(`provisionGitHubAccess: dedup key already set for ${applicationRef}, skipping`);
+    return;
+  }
 
   const repoName = `build-${applicationRef.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 60)}`;
   const ghHeaders = {
@@ -995,11 +1002,18 @@ async function handleShopifyWebhook(request: Request, env: Env): Promise<Respons
       phone: candidate.properties.Phone?.select?.name || '',
     };
 
-    await createOnboardingPlan(env, candidate.id, payload);
+    // Every step from here is independently best-effort. Confirmed live
+    // 2026-08-14: an unprotected createOnboardingPlan() call let a missing
+    // Notion connection on ONE sub-database (Build Tasks) throw uncaught
+    // and abort the entire handler before milestone seeding, certificate
+    // issuance, or GitHub provisioning ever ran -- despite Payment Status
+    // having already been marked Paid moments earlier. No single sub-system
+    // gets to block the rest of a paid candidate's processing again.
+    try { await createOnboardingPlan(env, candidate.id, payload); } catch (err) { console.error(`createOnboardingPlan failed for ${appRef}: ${err}`); }
     // Paid candidates get the full 16-milestone curriculum seeded so the
     // certification system has a real target to track.
     try { await seedMilestones(env, candidate.id); } catch { /* best-effort */ }
-    await updateProgressOnApplication(env, candidate.id);
+    try { await updateProgressOnApplication(env, candidate.id); } catch (err) { console.error(`updateProgressOnApplication failed for ${appRef}: ${err}`); }
   }
 
   // Certificate may already be issuable (e.g. milestones seeded earlier).
@@ -1011,8 +1025,11 @@ async function handleShopifyWebhook(request: Request, env: Env): Promise<Respons
   // Tier-1 item that's actually provisionable via API today.
   try {
     const githubUsername = candidate?.properties?.['GitHub Username']?.rich_text?.[0]?.plain_text;
+    console.log(`Webhook call site: candidate.kv=${!!candidate?.kv} githubUsername=${githubUsername || '(none)'}`);
     await provisionGitHubAccess(env, appRef, githubUsername);
-  } catch { /* best-effort */ }
+  } catch (err) {
+    console.error(`provisionGitHubAccess threw: ${err}`);
+  }
 
   await emitHubEvent(env, {
     type: 'build.paid',
