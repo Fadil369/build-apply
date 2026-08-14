@@ -902,6 +902,25 @@ async function handleShopifyWebhook(request: Request, env: Env): Promise<Respons
     return jsonResponse({ ok: false, error: 'Invalid JSON' }, 400, origin);
   }
 
+  // Confirmed live 2026-08-14: Shopify delivers this event to build-apply
+  // through more than one route (mirrors the same redundant-subscription
+  // pattern found and fixed on app.brainsait.de). Three near-simultaneous
+  // deliveries all read "not yet Paid" from Notion before the first one
+  // finishes writing, so all three race through milestone seeding,
+  // certificate issuance, and GitHub provisioning concurrently -- the
+  // Notion-state idempotency check below is real but too slow to catch
+  // this. This guard is atomic (KV put with no read-then-write gap) and
+  // runs before any slow processing starts, so only the first delivery
+  // proceeds; the rest get a clean 200 and stop here.
+  const orderKey = String(order.admin_graphql_api_id || order.id || '');
+  if (orderKey && env.APPLICATIONS) {
+    const dedupKey = `webhook-processed:${orderKey}`;
+    if (await env.APPLICATIONS.get(dedupKey)) {
+      return jsonResponse({ ok: true, idempotent: true, reason: 'duplicate delivery' }, 200, origin);
+    }
+    await env.APPLICATIONS.put(dedupKey, new Date().toISOString(), { expirationTtl: 7 * 24 * 60 * 60 });
+  }
+
   // application_ref is attached by the Build flow in the checkout link as a
   // line-item property (`properties[application_ref]` → line_items[].properties).
   // Also accept top-level note_attributes and order.properties for robustness.
