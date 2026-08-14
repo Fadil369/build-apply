@@ -1,0 +1,17 @@
+{
+  "name": "build-apply",
+  "private": true,
+  "version": "1.0.0",
+  "description": "BrainSAIT Build eligibility, application intake, Notion CRM and checkout orchestration",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260702.1",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.0.0"
+  }
+}

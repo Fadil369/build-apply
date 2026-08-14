@@ -1,0 +1,41 @@
+name = "build-apply"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+account_id = "d7b99530559ab4f2545e9bdc72a7ab9b"
+workers_dev = false
+
+routes = [
+  { pattern = "build-apply.brainsait.org", custom_domain = true }
+]
+
+[triggers]
+crons = ["0 9 * * *"]
+
+[[r2_buckets]]
+binding = "EVIDENCE_BUCKET"
+bucket_name = "build-evidence"
+
+[[kv_namespaces]]
+binding = "APPLICATIONS"
+id = "20ed085e26734a389d34d207ba830c97"
+
+[observability]
+enabled = true
+
+# Secrets (set via wrangler secret put):
+# NOTION_TOKEN
+# NOTION_BUILD_DB_ID
+# NOTION_COHORTS_DB_ID
+# NOTION_SPRINTS_DB_ID
+# NOTION_MILESTONES_DB_ID
+# NOTION_TASKS_DB_ID
+# TURNSTILE_SECRET
+# RESEND_API_KEY
+# RESEND_FROM_EMAIL (defaults to BrainSAIT <orders@send.brainsait.org>)
+# SHOPIFY_STORE_DOMAIN (optional)
+# SHOPIFY_ADMIN_TOKEN (required for customer sync)
+# SHOPIFY_WEBHOOK_SECRET (REQUIRED — webhooks are rejected without it)
+# ADMIN_TOKEN (optional, guards /admin/stats)
+# HUB_URL (defaults to https://brainsait.de)
+# HUB_KEY (optional)
