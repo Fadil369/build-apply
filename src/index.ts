@@ -1122,11 +1122,19 @@ interface ProgressInfo {
 }
 
 async function calculateProgress(env: Env, candidateId: string): Promise<ProgressInfo> {
-  const tasksData = env.NOTION_TASKS_DB_ID
-    ? await notionRequest(env, 'POST', `/databases/${env.NOTION_TASKS_DB_ID}/query`, {
+  // Each sub-database query is independently best-effort: a permissions gap
+  // or outage on Tasks shouldn't take down Milestones (or the whole request)
+  // and vice versa. Missing data degrades to zero progress, not a 500.
+  let tasksData: any = { results: [] };
+  if (env.NOTION_TASKS_DB_ID) {
+    try {
+      tasksData = await notionRequest(env, 'POST', `/databases/${env.NOTION_TASKS_DB_ID}/query`, {
         filter: { property: 'Candidate', relation: { contains: candidateId } },
-      })
-    : { results: [] };
+      });
+    } catch (err) {
+      console.error(`calculateProgress: Tasks query failed for ${candidateId}: ${err}`);
+    }
+  }
 
   const tasks = (tasksData.results || []).map((r: any) => {
     const p = r.properties;
@@ -1152,15 +1160,19 @@ async function calculateProgress(env: Env, candidateId: string): Promise<Progres
 
   let milestones: { name: string; status: string }[] = [];
   if (env.NOTION_MILESTONES_DB_ID) {
-    const mData = await notionRequest(env, 'POST', `/databases/${env.NOTION_MILESTONES_DB_ID}/query`, {
-      filter: { property: 'Candidate', relation: { contains: candidateId } },
-    });
-    milestones = (mData.results || []).map((r: any) => ({
-      name: r.properties.Name?.title?.[0]?.plain_text || 'Milestone',
-      status: r.properties.Status?.select?.name || 'Not Started',
-    }));
-    if (milestones.some((m) => m.status === 'Completed' && m.name.toLowerCase().includes('launch'))) {
-      if (!badges.includes('Launched')) badges.push('Launched');
+    try {
+      const mData = await notionRequest(env, 'POST', `/databases/${env.NOTION_MILESTONES_DB_ID}/query`, {
+        filter: { property: 'Candidate', relation: { contains: candidateId } },
+      });
+      milestones = (mData.results || []).map((r: any) => ({
+        name: r.properties.Name?.title?.[0]?.plain_text || 'Milestone',
+        status: r.properties.Status?.select?.name || 'Not Started',
+      }));
+      if (milestones.some((m) => m.status === 'Completed' && m.name.toLowerCase().includes('launch'))) {
+        if (!badges.includes('Launched')) badges.push('Launched');
+      }
+    } catch (err) {
+      console.error(`calculateProgress: Milestones query failed for ${candidateId}: ${err}`);
     }
   }
 
