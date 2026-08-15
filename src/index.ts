@@ -1298,6 +1298,137 @@ async function fanoutEvent(env: Env, eventType: string, studentEmail: string, pa
     });
   } catch { /* best-effort */ }
 }
+
+/**
+ * Subscription day-advance — every successful payment-mandate billing cycle
+ * unlocks the next curriculum day in D1 and pings the partner on Telegram.
+ * Capped at day 15 (16 days = 0..15). Idempotent at the cap.
+ */
+async function advanceStudentDay(env: Env, email: string, source: string): Promise<{ ok: boolean; day?: number; error?: string }> {
+  const norm = email.toLowerCase().trim();
+  if (!norm) return { ok: false, error: 'missing email' };
+  const stu = await d1GetStudent(env, norm);
+  if (!stu) return { ok: false, error: 'student not found in D1' };
+  const current = Number(stu.current_day || 0);
+  const next = Math.min(current + 1, 15);
+  if (next <= current) return { ok: true, day: next }; // already at final day
+
+  const now = new Date().toISOString();
+  try {
+    await env.BUILD_DB.prepare(`UPDATE students SET current_day = ?, updated_at = ? WHERE email = ?`).bind(next, now, norm).run();
+  } catch { return { ok: false, error: 'D1 update failed' }; }
+
+  // Log the event into the central stream.
+  try {
+    await env.BUILD_DB.prepare(
+      `INSERT INTO events (event_type, student_email, payload, created_at) VALUES (?, ?, ?, ?)`
+    ).bind('subscription.day_advanced', norm, JSON.stringify({ day: next, source }), now).run();
+  } catch { /* best-effort */ }
+
+  // Telegram ping (best-effort).
+  const chatId = stu.telegram_chat_id;
+  if (chatId && env.TELEGRAM_BOT_TOKEN) {
+    try {
+      await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: `📈 سُجّلت دفعة قسطك بنجاح — تقدّمت إلى اليوم ${next}. أكمل مختبر اليوم التالي في عقلك الثاني.`,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+    } catch { /* best-effort */ }
+  }
+  return { ok: true, day: next };
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * PRODUCT REVIEWS — D1-backed capture + retrieval. Self-contained today;
+ * mirrors to Shopify's Product Reviews API once that dev-app token lands.
+ * ───────────────────────────────────────────────────────────────────── */
+
+async function handleReviews(env: Env, slug: string, origin: string | null): Promise<Response> {
+  if (!slug) return jsonResponse({ ok: false, error: 'missing product slug' }, 400, origin);
+  try {
+    const rows = await env.BUILD_DB.prepare(
+      `SELECT rating, name, body, created_at FROM reviews WHERE product_slug = ? ORDER BY id DESC LIMIT 50`
+    ).bind(slug).all();
+    const reviews = (rows as any).results || [];
+    const n = reviews.length;
+    const avg = n ? Math.round((reviews.reduce((s: number, r: any) => s + Number(r.rating || 0), 0) / n) * 10) / 10 : 0;
+    return jsonResponse({ ok: true, slug, count: n, average: avg, reviews }, 200, origin);
+  } catch {
+    return jsonResponse({ ok: false, error: 'reviews unavailable' }, 500, origin);
+  }
+}
+
+async function handleSubmitReview(env: Env, slug: string, body: { rating?: number; name?: string; body?: string }, origin: string | null): Promise<Response> {
+  const rating = Math.max(1, Math.min(5, Number(body.rating || 5)));
+  const name = String(body.name || 'Anonymous').slice(0, 80);
+  const text = String(body.body || '').slice(0, 1000);
+  if (!slug || !text.trim()) return jsonResponse({ ok: false, error: 'slug and body required' }, 400, origin);
+  try {
+    await env.BUILD_DB.prepare(
+      `INSERT INTO reviews (product_slug, rating, name, body, created_at) VALUES (?, ?, ?, ?, ?)`
+    ).bind(slug, rating, name, text.trim(), new Date().toISOString()).run();
+    return jsonResponse({ ok: true, slug, rating }, 200, origin);
+  } catch {
+    return jsonResponse({ ok: false, error: 'review not saved' }, 500, origin);
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * BASMA RECOMMENDER — the "which track?" matcher behind checkout/chat.
+ * Rule-based (deterministic, zero-latency) so it works everywhere; the
+ * same contract can be swapped for an LLM call without changing callers.
+ * ───────────────────────────────────────────────────────────────────── */
+
+interface RecommendInput {
+  goal?: string;      // learn | build | solution | sell | automate
+  stage?: string;     // idea | validating | scaling | established
+  budget?: number;
+  time?: number;      // weeks available
+  lang?: string;
+}
+
+function recommendTrack(input: RecommendInput): { track: string; trackAr: string; reason: string; reasonAr: string; products: string[] } {
+  const g = String(input.goal || '').toLowerCase();
+  const stage = String(input.stage || '').toLowerCase();
+  const time = Number(input.time || 0);
+  const budget = Number(input.budget || 0);
+
+  // SOLUTIONS — need a ready, production system now (or enterprise budget).
+  if (g.includes('solution') || g.includes('sell') || g.includes('enterprise') || budget >= 20000) {
+    return {
+      track: 'SOLUTIONS',
+      trackAr: 'حلول',
+      reason: 'You need a production-ready system or an enterprise build — not a course.',
+      reasonAr: 'أنت تحتاج نظامًا جاهزًا للإنتاج أو بناءً مؤسسيًا — وليس دورة.',
+      products: ['abeer-connected-healthcare-platform', 'ai-claims-reconciliation'],
+    };
+  }
+  // BUILD — you want to build/launch a business or product.
+  if (g.includes('build') || g.includes('startup') || g.includes('business') || g.includes('incubat') || g.includes('found') || stage.includes('idea') || stage.includes('validat')) {
+    return {
+      track: 'BUILD',
+      trackAr: 'ابنِ',
+      reason: 'You are ready to go from idea to a launched product — the 16-day incubation program fits.',
+      reasonAr: 'أنت جاهز للانتقال من الفكرة إلى منتج مُطلق — برنامج الاحتضان (16 يومًا) يناسبك.',
+      products: ['build-ticket-incubation-pass'],
+    };
+  }
+  // LEARN — default: read/study/grow.
+  return {
+    track: 'LEARN',
+    trackAr: 'تعلّم',
+    reason: 'Start by learning — books and courses build the foundation before you build.',
+    reasonAr: 'ابدأ بالتعلّم — الكتب والدورات تبني الأساس قبل أن تبني.',
+    products: ['all-men', 'between-one-beat-and-another-arabic'],
+  };
+}
 /* ───────────────────────────────────────────────────────────────────── */
 
 function kvBadges(tasks: KvTask[]): string[] {
@@ -1542,7 +1673,42 @@ async function handleInstallmentPayment(
   return null;
 }
 
-async function handleShopifyWebhook(request: Request, env: Env): Promise<Response> {
+/**
+ * Subscription (payment-mandate) webhook events → day-advance. A successful
+ * billing attempt unlocks the next curriculum day in D1 and pings Telegram.
+ */
+async function handleSubscriptionEvent(env: Env, topic: string, payload: any, origin: string | null): Promise<Response> {
+  let email = String(
+    payload.customer?.email ||
+    payload.subscription_contract?.customer?.email ||
+    payload.email ||
+    ''
+  ).toLowerCase().trim();
+
+  // Billing-attempt payloads reference a contract id but not always the email.
+  const contractId = String(payload.subscription_contract_id || payload.subscription_contract?.id || '');
+  if (!email && contractId) {
+    try {
+      const g = await shopifyGraphQL(env,
+        `query($id: ID!){ subscriptionContract(id: $id) { customer { email } } }`,
+        { id: contractId });
+      email = String(g?.data?.subscriptionContract?.customer?.email || '').toLowerCase().trim();
+    } catch { /* best-effort */ }
+  }
+
+  if (!email) {
+    return jsonResponse({ ok: false, error: 'no customer email on subscription event' }, 400, origin);
+  }
+
+  if (topic.includes('billing_attempts/success')) {
+    const r = await advanceStudentDay(env, email, 'subscription_billing');
+    return jsonResponse({ ok: true, advanced: r.ok, day: r.day, email }, 200, origin);
+  }
+
+  return jsonResponse({ ok: true, acknowledged: true, topic }, 200, origin);
+}
+
+async function handleShopifyWebhook(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const origin = request.headers.get('origin');
   const body = await request.text();
   const hmac = request.headers.get('x-shopify-hmac-sha256') || '';
@@ -1561,6 +1727,14 @@ async function handleShopifyWebhook(request: Request, env: Env): Promise<Respons
   const ok = await verifyShopifyHmac(body, hmac, env.SHOPIFY_WEBHOOK_SECRET);
   if (!ok) {
     return jsonResponse({ ok: false, error: 'Invalid Shopify HMAC' }, 401, origin);
+  }
+
+  if (topic && topic.startsWith('subscriptions/')) {
+    let payload: any;
+    try { payload = JSON.parse(body); } catch {
+      return jsonResponse({ ok: false, error: 'Invalid JSON' }, 400, origin);
+    }
+    return handleSubscriptionEvent(env, topic, payload, origin);
   }
 
   if (topic && topic !== 'orders/paid') {
@@ -1614,11 +1788,74 @@ async function handleShopifyWebhook(request: Request, env: Env): Promise<Respons
 
   if (!appRef) {
     // Genuine Shopify order that is not a BUILD ticket (e.g. regular store
-    // purchase). Acknowledge so Shopify stops retrying.
-    return jsonResponse({ ok: true, ignored: true, reason: 'not a BUILD order' }, 200, origin);
+    // purchase). Acknowledge, then trigger the post-purchase BUILD upsell.
+    ctx.waitUntil(handlePostPurchaseUpsell(env, order));
+    return jsonResponse({ ok: true, ignored: true, reason: 'not a BUILD order', upsell: true }, 200, origin);
   }
 
   return await provisionPaidApplication(env, order, appRef, origin);
+}
+
+/**
+ * Post-purchase BUILD upsell — when a customer buys a LEARN product (a book
+ * or novel), gently invite them to graduate from "reader" to "builder" with
+ * the BUILD incubation program. Three coordinated side-effects:
+ *   1. log the event into the D1 central state,
+ *   2. tag the Shopify customer for segmentation,
+ *   3. send a luxury bilingual invitation email.
+ * Best-effort throughout — never throws.
+ */
+async function handlePostPurchaseUpsell(env: Env, order: any): Promise<void> {
+  const email = String(order.email || order.contact_email || (order.customer?.email) || '').toLowerCase().trim();
+  if (!email) return;
+  const titles = (order.line_items || []).map((li: any) => String(li.title || li.name || ''));
+  // The BUILD ticket is handled by the main provisioning path — skip it here.
+  if (titles.some((t: string) => /BUILD|incubation/i.test(t))) return;
+  const firstName = String((order.customer?.first_name) || '').trim();
+
+  // 1. Log to D1 central event state.
+  try {
+    await env.BUILD_DB.prepare(
+      `INSERT INTO events (event_type, student_email, payload, created_at) VALUES (?, ?, ?, ?)`
+    ).bind('shopify.post_purchase', email, JSON.stringify({ titles, total: order.total_price }), new Date().toISOString()).run();
+  } catch { /* best-effort */ }
+
+  // 2. Tag the Shopify customer for post-purchase segmentation.
+  if (order.customer?.id) {
+    try {
+      const cur = await shopifyRest(env, 'GET', `customers/${order.customer.id}.json`);
+      const existing = String(cur.data?.customer?.tags || '');
+      const tags = existing ? `${existing}, post-purchase-upsell` : 'post-purchase-upsell';
+      await shopifyRest(env, 'PUT', `customers/${order.customer.id}.json`, { customer: { id: order.customer.id, tags } });
+    } catch { /* best-effort */ }
+  }
+
+  // 3. Send the invitation email.
+  if (!env.RESEND_API_KEY) return;
+  const name = firstName || 'Founder';
+  const body = `
+    <p style="margin:0 0 14px;color:#8a6d1f;font-family:Arial,sans-serif;font-size:12px;letter-spacing:.1em;text-transform:uppercase;">أهلًا بك في عائلة برينسايت</p>
+    <p style="margin:0 0 16px;font-size:19px;color:#131320;"><b>${escapeHtml(name)}، شكرًا لأنك بدأت بالقراءة 📖</b></p>
+    <p style="margin:0 0 16px;color:#555;font-size:15px;line-height:1.8;">القارئ يرى، والباني يملك. أنت اخترت أن تتعلّم — والخطوة الطبيعية التالية أن <b>تبني</b>.</p>
+    <p style="margin:0 0 16px;color:#555;font-size:15px;line-height:1.8;">برنامج <b>BUILD</b> يحوّلك من قارئ إلى مؤسّس خلال 16 يومًا: متجرك، منتجك، أتمتتك، وعقلك الثاني — كلّه جاهز للانطلاق.</p>
+    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:18px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:14px 34px;">
+      <a href="https://fadil369.github.io/build" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">اكتشف BUILD 🚀</a>
+    </td></tr></table>
+    <p style="margin:0;text-align:center;color:#999;font-size:12px;font-family:Arial,sans-serif;">أو تصفّح المتجر كاملًا: <a href="https://fadil369.github.io" style="color:#8a6d1f;">fadil369.github.io</a></p>
+  `;
+  const html = luxuryEmailShell('جاهز تبني؟ · Ready to build?', body);
+  try {
+    await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: env.RESEND_FROM_EMAIL || RESEND_FROM,
+        to: email,
+        subject: `✨ ${name} — من قارئ إلى باني | From reader to builder`,
+        html,
+      }),
+    });
+  } catch { /* best-effort */ }
 }
 
 async function provisionPaidApplication(env: Env, order: any, appRef: string, origin: string | null): Promise<Response> {
@@ -3993,7 +4230,7 @@ export default {
     }
 
     if (url.pathname === '/webhook/shopify' && request.method === 'POST') {
-      return handleShopifyWebhook(request, env);
+      return handleShopifyWebhook(request, env, ctx);
     }
 
     if (url.pathname.endsWith('/pdf') && url.pathname.startsWith('/certificate/') && request.method === 'GET') {
@@ -4047,6 +4284,18 @@ export default {
       return handleAdminCommerce(request, env);
     }
 
+    // Manual day-advance (simulates a successful subscription billing attempt).
+    if (url.pathname === '/admin/advance' && request.method === 'POST') {
+      const token = request.headers.get('x-admin-token') || '';
+      if (!env.ADMIN_TOKEN || token !== env.ADMIN_TOKEN) {
+        return jsonResponse({ ok: false, error: 'unauthorized' }, 401, origin);
+      }
+      const body = (await request.json().catch(() => ({}))) as { email?: string };
+      if (!body.email) return jsonResponse({ ok: false, error: 'Missing email' }, 400, origin);
+      const r = await advanceStudentDay(env, body.email, 'manual');
+      return jsonResponse(r, 200, origin);
+    }
+
     // On-demand reliability sweep: re-provisions any paid BUILD order the
     // webhook missed. Guarded by the same ADMIN_TOKEN as /admin/stats.
     if (url.pathname === '/admin/sweep' && request.method === 'POST') {
@@ -4095,6 +4344,23 @@ export default {
         await d1LogEvent(ctx, env, eventType, body.student_email, body);
       } catch { /* best-effort */ }
       return jsonResponse({ ok: true, event: eventType, student_email: body.student_email }, 200, origin);
+    }
+
+    // PRODUCT REVIEWS — D1-backed review capture + retrieval (ready to mirror
+    // to Shopify's Product Reviews API once the dev-app token is wired).
+    if (url.pathname.startsWith('/reviews/')) {
+      const slug = decodeURIComponent(url.pathname.slice('/reviews/'.length));
+      if (request.method === 'GET') return handleReviews(env, slug, origin);
+      if (request.method === 'POST') {
+        const body = (await request.json().catch(() => ({}))) as { rating?: number; name?: string; body?: string };
+        return handleSubmitReview(env, slug, body, origin);
+      }
+    }
+
+    // BASMA RECOMMENDER — "which track?" (LEARN / BUILD / SOLUTIONS) matcher.
+    if (url.pathname === '/recommend' && request.method === 'POST') {
+      const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+      return jsonResponse(recommendTrack(body), 200, origin);
     }
 
     // INSTALLMENT SYSTEM endpoints.
