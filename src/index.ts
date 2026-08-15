@@ -482,6 +482,22 @@ const ACCOUNT_URL = 'https://account.brainsait.org';
 const BUILD_TRACK_URL = 'https://fadil369.github.io/track';
 const BUILD_CERT_BASE = 'https://build-apply.brainsait.org';
 const GITHUB_PROFILE_URL = 'https://github.com';
+// Canva Design Registry — the design/visual layer of the BUILD program.
+const DESIGN_REGISTRY_URL = 'https://hub.brainsait.de/canva';
+
+/** Map a BUILD day → Canva Design Registry categories whose templates the
+ *  partner should use for that day's deliverables. */
+function designCategoriesForDay(day: number): string[] {
+  const map: Record<number, string[]> = {
+    0: ['documentation'],                      // ignition — welcome pack
+    2: ['cover', 'marketing'],                 // branding & identity
+    5: ['Social'],                             // launch — ads & announcement
+    6: ['Social/Sales', 'Social/Partnerships'],// market channels
+    13: ['Social'],                            // personal brand / thought leadership
+    14: ['certificate', 'report'],             // graduation
+  };
+  return map[day] || [];
+}
 
 // All transactional mail is sent from the verified Resend domain. Verified
 // working sender (2026-08-14, confirmed delivered to Gmail):
@@ -1428,6 +1444,33 @@ function recommendTrack(input: RecommendInput): { track: string; trackAr: string
     reasonAr: 'ابدأ بالتعلّم — الكتب والدورات تبني الأساس قبل أن تبني.',
     products: ['all-men', 'between-one-beat-and-another-arabic'],
   };
+}
+
+/**
+ * Fetch the Canva Design Registry templates relevant to a BUILD day and
+ * return them with a Canva editor deep-link. Best-effort — never throws.
+ */
+async function handleDesignsForDay(day: number, origin: string | null): Promise<Response> {
+  const categories = designCategoriesForDay(day);
+  const params = categories.map((c) => `category=${encodeURIComponent(c)}`).join('&');
+  try {
+    const res = await fetch(`${DESIGN_REGISTRY_URL}/api/templates?${params}`, {
+      signal: AbortSignal.timeout(6000),
+    });
+    const data = (await res.json()) as { templates?: any[] };
+    const templates = data.templates || [];
+    return jsonResponse({
+      ok: true,
+      day,
+      categories,
+      count: templates.length,
+      templates,
+      registry: DESIGN_REGISTRY_URL,
+      canvaApp: 'https://app-aahogifdfbg.canva-apps.com',
+    }, 200, origin);
+  } catch {
+    return jsonResponse({ ok: false, error: 'design registry unreachable' }, 502, origin);
+  }
 }
 /* ───────────────────────────────────────────────────────────────────── */
 
@@ -2626,6 +2669,7 @@ async function sendDailyCurriculumEmail(env: Env, email: string, name: string, d
       <a href="${SECOND_BRAIN_URL}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">افتح دماغك الثاني 🧠</a>
     </td></tr></table>
     <p style="margin:0 0 8px;text-align:center;color:#666;font-size:13px;font-family:Arial,sans-serif;">لوحة التقدم: <a href="${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}" style="color:#8a6d1f;">تتبّع معالمك</a></p>
+    ${designCategoriesForDay(c.day).length ? `<p style="margin:0;text-align:center;color:#666;font-size:13px;font-family:Arial,sans-serif;">قوالب التصميم: <a href="https://build-apply.brainsait.org/designs/${c.day}" style="color:#8a6d1f;">افتح قوالب اليوم 🎨</a></p>` : ''}
   `;
   const html = luxuryEmailShell(`يوم ${c.day} · ${c.title}`, body);
   await fetch('https://api.resend.com/emails', {
@@ -4364,6 +4408,13 @@ export default {
       const res = jsonResponse(recommendTrack(body), 200, origin);
       res.headers.set('Access-Control-Allow-Origin', '*');
       return res;
+    }
+
+    // CANVA DESIGN REGISTRY — surface the design templates for a BUILD day.
+    if (url.pathname.startsWith('/designs/') && request.method === 'GET') {
+      const day = parseInt(url.pathname.slice('/designs/'.length), 10);
+      if (Number.isNaN(day)) return jsonResponse({ ok: false, error: 'invalid day' }, 400, origin);
+      return handleDesignsForDay(day, origin);
     }
 
     // INSTALLMENT SYSTEM endpoints.
