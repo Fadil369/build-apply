@@ -4410,6 +4410,21 @@ export default {
       return jsonResponse({ ok: true, event: eventType, student_email: body.student_email }, 200, origin);
     }
 
+    // PIXEL EVENT SINK — public endpoint that the Shopify web pixel forwards
+    // attribution events to (page_viewed, product_viewed, purchase, …).
+    if (url.pathname === '/pixel' && request.method === 'POST') {
+      const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+      const event = String(body.event || 'unknown');
+      const res = jsonResponse({ ok: true, event }, 200, origin);
+      res.headers.set('Access-Control-Allow-Origin', '*');
+      try {
+        await env.BUILD_DB.prepare(
+          `INSERT INTO events (event_type, student_email, payload, created_at) VALUES (?, ?, ?, ?)`
+        ).bind(`pixel.${event}`, '', JSON.stringify(body), new Date().toISOString()).run();
+      } catch { /* best-effort */ }
+      return res;
+    }
+
     // PRODUCT REVIEWS — D1-backed review capture + retrieval (ready to mirror
     // to Shopify's Product Reviews API once the dev-app token is wired).
     if (url.pathname.startsWith('/reviews/')) {
