@@ -4358,9 +4358,12 @@ export default {
     }
 
     // BASMA RECOMMENDER — "which track?" (LEARN / BUILD / SOLUTIONS) matcher.
+    // Public + non-sensitive, so it allows any origin (Shopify checkout iframe).
     if (url.pathname === '/recommend' && request.method === 'POST') {
       const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-      return jsonResponse(recommendTrack(body), 200, origin);
+      const res = jsonResponse(recommendTrack(body), 200, origin);
+      res.headers.set('Access-Control-Allow-Origin', '*');
+      return res;
     }
 
     // INSTALLMENT SYSTEM endpoints.
