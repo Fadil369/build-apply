@@ -2950,6 +2950,137 @@ async function handleAdminStats(request: Request, env: Env): Promise<Response> {
   }, 200, origin);
 }
 
+/**
+ * "Commerce Pulse" — live unified dashboard joining Shopify (orders +
+ * Subscriptions API + payment mandates) with the BUILD program's central D1
+ * state. Powered by the newly-granted read_all_orders + subscriptions scopes.
+ */
+async function handleAdminCommerce(request: Request, env: Env): Promise<Response> {
+  const token = request.headers.get('x-admin-token') || '';
+  if (!env.ADMIN_TOKEN || token !== env.ADMIN_TOKEN) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+
+  // ── 1. Shopify orders (read_all_orders scope) ──
+  let orders: any[] = [];
+  try {
+    const r = await shopifyRest(env, 'GET', 'orders.json?status=any&limit=50');
+    orders = (r.data?.orders || []) as any[];
+  } catch { /* best-effort */ }
+
+  // ── 2. Shopify subscriptions (Subscriptions API scope) ──
+  let subscriptions: any[] = [];
+  try {
+    const g = await shopifyGraphQL(env,
+      `{ subscriptionContracts(first: 30) { edges { node { id status createdAt customer { email firstName lastName } } } } }`,
+      {});
+    subscriptions = (g?.data?.subscriptionContracts?.edges || []).map((e: any) => e.node);
+  } catch { /* best-effort */ }
+
+  // ── 3. BUILD students (D1 central state) ──
+  const students = new Map<string, Record<string, unknown>>();
+  try {
+    const rows = await env.BUILD_DB.prepare(`SELECT * FROM students ORDER BY updated_at DESC LIMIT 200`).all();
+    for (const s of (rows as any).results || []) students.set(String(s.email).toLowerCase(), s);
+  } catch { /* best-effort */ }
+
+  // ── 4. Aggregate KPIs ──
+  const paid = orders.filter((o) => o.financial_status === 'paid');
+  const revenue = paid.reduce((sum: number, o: any) => sum + Number(o.total_price || 0), 0);
+  const activeSubs = subscriptions.filter((s) => s.status === 'ACTIVE');
+  const subsMrr = activeSubs.length;
+
+  const esc = (s: unknown) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
+
+  // ── Order rows (joined with BUILD students) ──
+  const orderRows = orders.map((o) => {
+    const email = String(o.email || (o.customer?.email) || '').toLowerCase();
+    const stu = students.get(email);
+    const items = (o.line_items || []).map((li: any) => li.title).join(', ');
+    const prog = stu ? `Day ${stu.current_day ?? 0} · ${esc(stu.status || 'pending')}` : '—';
+    const badge = stu ? '<span class="chip chip-yes">BUILD</span>' : '<span class="chip">visitor</span>';
+    return `<tr>
+      <td class="mono">${esc(o.name)}</td>
+      <td>${esc(email || '?')}</td>
+      <td class="dim">${esc(items || '—')}</td>
+      <td class="num">${Number(o.total_price || 0).toFixed(0)} SAR</td>
+      <td>${o.financial_status === 'paid' ? '<span class="chip chip-paid">paid</span>' : `<span class="chip">${esc(o.financial_status)}</span>`}</td>
+      <td>${badge} ${prog}</td>
+    </tr>`;
+  }).join('');
+
+  const subRows = subscriptions.map((s) => {
+    const email = String(s.customer?.email || '').toLowerCase();
+    const stu = students.get(email);
+    const cls = s.status === 'ACTIVE' ? 'chip-paid' : s.status === 'CANCELLED' ? '' : 'chip-yes';
+    return `<tr>
+      <td class="mono">${esc(String(s.id).split('/').pop())}</td>
+      <td>${esc(email || '?')}</td>
+      <td>${esc(s.createdAt?.slice(0, 10) || '—')}</td>
+      <td><span class="chip ${cls}">${esc(s.status)}</span></td>
+      <td>${stu ? `Day ${stu.current_day ?? 0}` : '—'}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="5" class="dim" style="text-align:center">No subscriptions yet</td></tr>';
+
+  const html = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BrainSAIT — Commerce Pulse</title>
+<meta http-equiv="refresh" content="30">
+<style>
+  :root{--bg:#070b14;--panel:#0f1626;--line:rgba(255,255,255,.08);--text:#eef1f6;--muted:#8b94a7;--gold:#e9c46a;--gold2:#c9a227;--cyan:#29d8ff;--ok:#3ecf8e;--rose:#fb7185;}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Inter',system-ui,sans-serif;background:radial-gradient(ellipse at top,#0c1322,#070b14 60%);color:var(--text);min-height:100vh;padding:2rem 1.2rem}
+  .wrap{max-width:1100px;margin:0 auto}
+  .head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem;margin-bottom:1.6rem}
+  .head h1{font-size:1.6rem;font-weight:800;letter-spacing:-.02em}
+  .head h1 span{background:linear-gradient(100deg,var(--gold),var(--cyan));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .ts{color:var(--muted);font-size:.8rem}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:1.6rem}
+  .kpi{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:1.2rem;position:relative;overflow:hidden}
+  .kpi::before{content:"";position:absolute;inset:0;background:linear-gradient(135deg,rgba(201,162,39,.08),transparent 60%)}
+  .kpi .l{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.12em}
+  .kpi .v{font-size:1.9rem;font-weight:800;margin-top:.3rem}
+  .kpi .v.g{color:var(--gold)}
+  .kpi .v.c{color:var(--cyan)}
+  .kpi .v.o{color:var(--ok)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:1.3rem;margin-bottom:1.4rem;overflow-x:auto}
+  .card h2{font-size:1rem;font-weight:700;margin-bottom:1rem;display:flex;align-items:center;gap:.5rem}
+  .card h2::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--gold2);box-shadow:0 0 10px var(--gold2)}
+  table{width:100%;border-collapse:collapse;font-size:.85rem}
+  th{text-align:left;color:var(--muted);font-weight:600;font-size:.7rem;text-transform:uppercase;letter-spacing:.08em;padding:.5rem .6rem;border-bottom:1px solid var(--line)}
+  td{padding:.6rem;border-bottom:1px solid rgba(255,255,255,.04);vertical-align:middle}
+  .mono{font-family:'SF Mono',monospace;font-size:.8rem}
+  .num{text-align:right;font-weight:700}
+  .dim{color:var(--muted)}
+  .chip{display:inline-block;font-size:.66rem;font-weight:700;padding:.2rem .55rem;border-radius:999px;background:rgba(255,255,255,.06);color:var(--muted);border:1px solid var(--line)}
+  .chip-paid{background:rgba(62,207,142,.14);color:var(--ok);border-color:rgba(62,207,142,.3)}
+  .chip-yes{background:rgba(233,196,106,.14);color:var(--gold);border-color:rgba(233,196,106,.3)}
+</style></head><body><div class="wrap">
+  <div class="head">
+    <h1>BrainSAIT <span>Commerce Pulse</span></h1>
+    <div class="ts">Live · Shopify ⇄ D1 · ${new Date().toISOString().replace('T',' ').slice(0,19)} UTC</div>
+  </div>
+  <div class="kpis">
+    <div class="kpi"><div class="l">Total Revenue (paid)</div><div class="v g">${revenue.toLocaleString()} <small style="font-size:.8rem">SAR</small></div></div>
+    <div class="kpi"><div class="l">Orders</div><div class="v">${orders.length}</div></div>
+    <div class="kpi"><div class="l">Active Subscriptions</div><div class="v c">${subsMrr}</div></div>
+    <div class="kpi"><div class="l">BUILD Students (D1)</div><div class="v o">${students.size}</div></div>
+  </div>
+  <div class="card">
+    <h2>Recent Orders · joined with BUILD progress</h2>
+    <table><thead><tr><th>Order</th><th>Customer</th><th>Items</th><th>Total</th><th>Status</th><th>BUILD</th></tr></thead>
+    <tbody>${orderRows || '<tr><td colspan="6" class="dim" style="text-align:center">No orders</td></tr>'}</tbody></table>
+  </div>
+  <div class="card">
+    <h2>Subscriptions · payment mandates</h2>
+    <table><thead><tr><th>Contract</th><th>Customer</th><th>Created</th><th>Status</th><th>BUILD Day</th></tr></thead>
+    <tbody>${subRows}</tbody></table>
+  </div>
+</div></body></html>`;
+
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+}
+
 const SHOPIFY_SHOP_DOMAIN = 'brainsait.myshopify.com';
 const SHOPIFY_API_VERSION = '2025-10';
 
@@ -3909,6 +4040,11 @@ export default {
 
     if (url.pathname === '/admin/stats' && request.method === 'GET') {
       return handleAdminStats(request, env);
+    }
+
+    // "Commerce Pulse" — live Shopify orders + subscriptions ⇄ D1 BUILD state.
+    if (url.pathname === '/admin/commerce' && request.method === 'GET') {
+      return handleAdminCommerce(request, env);
     }
 
     // On-demand reliability sweep: re-provisions any paid BUILD order the
