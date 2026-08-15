@@ -478,6 +478,8 @@ const SECOND_BRAIN_URL = 'https://fadil369.notion.site/Ultimate-Brain-3bc3479c6f
 const FOUNDER_OS_URL = 'https://fadil369.notion.site/Founder-OS-3ba3479c6f628117966fd1be6c120ac2';
 const ULTIMATE_BRAIN_BUILD_URL = 'https://fadil369.notion.site/Ultimate-Brain-30b3479c6f62801083b8ce6842e5df45';
 const CALENDAR_URL = 'https://calendar.app.google/rAqiE6pNumtECdnd7';
+const SPARK_URL = 'https://spark.brainsait.org';
+const GTM_PLAYBOOK_URL = 'https://gtm.brainsait.org';
 const ACCOUNT_URL = 'https://account.brainsait.org';
 const BUILD_TRACK_URL = 'https://fadil369.github.io/track';
 const BUILD_CERT_BASE = 'https://build-apply.brainsait.org';
@@ -2678,6 +2680,7 @@ async function sendDailyCurriculumEmail(env: Env, email: string, name: string, d
     </td></tr></table>
     <p style="margin:0 0 8px;text-align:center;color:#666;font-size:13px;font-family:Arial,sans-serif;">لوحة التقدم: <a href="${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}" style="color:#8a6d1f;">تتبّع معالمك</a></p>
     ${designCategoriesForDay(c.day).length ? `<p style="margin:0;text-align:center;color:#666;font-size:13px;font-family:Arial,sans-serif;">قوالب التصميم: <a href="https://build-apply.brainsait.org/designs/${c.day}" style="color:#8a6d1f;">افتح قوالب اليوم 🎨</a></p>` : ''}
+    ${c.day === 0 ? `<p style="margin:0;text-align:center;color:#666;font-size:13px;font-family:Arial,sans-serif;">لعبة الفكرة: <a href="${SPARK_URL}" style="color:#8a6d1f;">العب SPARK 🎮 — من الفكرة إلى الإطلاق</a></p>` : ''}
   `;
   const html = luxuryEmailShell(`يوم ${c.day} · ${c.title}`, body);
   await fetch('https://api.resend.com/emails', {
