@@ -1,6 +1,11 @@
+import { BUILD_CURRICULUM, curriculumForDay, curriculumDayForProgramStart } from './curriculum';
+import { generateCertificatePdf } from './certificate-pdf';
+import { signCertificateWithAdobe } from './adobe-sign';
+
 export interface Env {
   EVIDENCE_BUCKET: R2Bucket;
   APPLICATIONS: KVNamespace;
+  BUILD_DB: D1Database;
   NOTION_TOKEN: string;
   NOTION_BUILD_DB_ID: string;
   NOTION_COHORTS_DB_ID?: string;
@@ -16,7 +21,22 @@ export interface Env {
   ADMIN_TOKEN?: string;
   HUB_URL?: string;
   HUB_KEY?: string;
+  MCP_HUB_KEY?: string;
   GITHUB_TOKEN?: string;
+  // Personal Telegram onboarding for paid partners (the FORGE bot). Cohort
+  // invite link is optional — the message works without it.
+  TELEGRAM_BOT_TOKEN?: string;
+  TELEGRAM_COHORT_LINK?: string;
+  // Airtable mirror of the Build pipeline (optional; activates when all
+  // three are configured on the worker).
+  AIRTABLE_API_KEY?: string;
+  AIRTABLE_BASE_ID?: string;
+  AIRTABLE_CANDIDATES_TABLE?: string;
+  // Adobe Acrobat Sign — electronic signature for issued certificates.
+  ADOBE_SIGN_INTEGRATION_KEY?: string;
+  ADOBE_SIGN_CLIENT_SECRET?: string;
+  ADOBE_SIGN_BASE?: string;
+  ADOBE_SIGN_SIGNER_EMAIL?: string;
 }
 
 interface KvTask {
@@ -48,6 +68,7 @@ interface KvApplication {
   notionUrl?: string;
   evidenceKey?: string;
   telegramId?: string;
+  githubUsername?: string;
   createdAt: string;
   tasks: KvTask[];
 }
@@ -76,6 +97,358 @@ interface ApplyPayload {
   promoCode?: string;
   turnstileToken?: string;
   evidenceFile?: { name: string; type: string; base64: string } | null;
+  /** Installment plan: 'full' (one payment) | 'flex' (2×50%) | 'split' (3 payments). */
+  plan?: string;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * INSTALLMENT SYSTEM — strict tracking, follow-up and suspension.
+ *
+ * The BUILD Ticket (SAR 9,630) can be paid in installments. Every plan is
+ * tracked in KV under `installment:<appRef>` with a per-payment schedule,
+ * payment history and status. Each installment gets its own checkout URL
+ * carrying `properties[installment_ref]` so the webhook can map partial
+ * payments without ever mis-marking the application as fully paid.
+ *
+ * Reminder escalation (cron, daily): T-3d friendly → T-1d nudge → T+1d
+ * urgent → T+3d final → T+7d warning → ≥14d OVERDUE → SUSPENDED (profile +
+ * Notion + access revoked). Payment resumes → ACTIVE again.
+ * ───────────────────────────────────────────────────────────────────── */
+
+type InstallmentStatus = 'PENDING' | 'PAID' | 'OVERDUE';
+
+interface Installment {
+  no: number;
+  label: string;        // e.g. "Down payment", "Month 2"
+  amount: number;       // SAR
+  dueAt: string;        // ISO date of first payment
+  status: InstallmentStatus;
+  paidAt?: string;
+  orderId?: string;
+  reminderStage: number; // 0..6, max level reached
+}
+
+interface InstallmentPlan {
+  ref: string;
+  email: string;
+  fullName: string;
+  phone?: string;
+  plan: 'full' | 'flex' | 'split' | 'quarter';
+  total: number;
+  installments: Installment[];
+  status: 'ACTIVE' | 'COMPLETED' | 'SUSPENDED';
+  createdAt: string;
+  suspendedAt?: string;
+  suspendedReason?: string;
+}
+
+const INSTALLMENT_DEFS: Record<string, { label: string; share: number }[]> = {
+  full: [{ label: 'Full payment', share: 1 }],
+  flex: [
+    { label: 'Down payment (50%)', share: 0.5 },
+    { label: 'Balance (50%)', share: 0.5 },
+  ],
+  split: [
+    { label: 'Down payment', share: 1 / 3 },
+    { label: 'Installment 2', share: 1 / 3 },
+    { label: 'Final installment', share: 1 - 2 / 3 },
+  ],
+  quarter: [
+    { label: 'Down payment (25%)', share: 0.25 },
+    { label: 'Installment 2', share: 0.25 },
+    { label: 'Installment 3', share: 0.25 },
+    { label: 'Final installment', share: 0.25 },
+  ],
+};
+
+function buildInstallmentSchedule(ref: string, email: string, fullName: string, phone: string | undefined, plan: string, total: number, today = new Date()): InstallmentPlan {
+  const defs = INSTALLMENT_DEFS[plan] || INSTALLMENT_DEFS.full;
+  const now = today.toISOString();
+  // Compute non-final amounts from the share, then make the LAST installment
+  // absorb the rounding remainder so the schedule always sums EXACTLY to total
+  // (e.g. quarter: 2408 + 2408 + 2407 + 2407 = 9630, not 9632).
+  const amounts: number[] = defs.map((d, i) => (i === defs.length - 1 ? 0 : Math.round(d.share * total)));
+  const paidSoFar = amounts.reduce((a, b) => a + b, 0);
+  amounts[amounts.length - 1] = total - paidSoFar;
+  const installments: Installment[] = defs.map((d, i) => {
+    const due = new Date(now);
+    due.setUTCDate(due.getUTCDate() + (i === 0 ? 0 : 30 * i));
+    return {
+      no: i + 1,
+      label: d.label,
+      amount: amounts[i],
+      dueAt: due.toISOString(),
+      status: 'PENDING',
+      reminderStage: 0,
+    };
+  });
+  return {
+    ref, email, fullName, phone, plan: plan as InstallmentPlan['plan'], total, installments,
+    status: 'ACTIVE', createdAt: now,
+  };
+}
+
+async function getInstallmentPlan(env: Env, ref: string): Promise<InstallmentPlan | null> {
+  try {
+    const raw = await env.APPLICATIONS.get(`installment:${ref}`, 'json');
+    return raw as InstallmentPlan | null;
+  } catch { return null; }
+}
+
+async function saveInstallmentPlan(env: Env, plan: InstallmentPlan): Promise<void> {
+  try { await env.APPLICATIONS.put(`installment:${refKey(plan.ref)}`, JSON.stringify(plan), { expirationTtl: 730 * 24 * 60 * 60 }); } catch { /* best-effort */ }
+}
+function refKey(ref: string): string {
+  // KV keys may not contain some characters; keep refs compact.
+  return ref.replace(/[^a-zA-Z0-9-]/g, '');
+}
+
+function installmentPaymentUrl(env: Env, appRef: string, plan: InstallmentPlan, no: number): string {
+  const inst = plan.installments.find((x) => x.no === no) || plan.installments[0];
+  const variantId = SHOPIFY_VARIANTS.standard;
+  const shop = env.SHOPIFY_STORE_DOMAIN || 'store.brainsait.org';
+  const params = new URLSearchParams();
+  params.set('id', variantId);
+  params.set('quantity', '1');
+  params.set('properties[eligibility_tier]', 'standard');
+  params.set('properties[final_price]', String(inst.amount));
+  params.set('properties[application_ref]', appRef);
+  params.set('properties[installment_ref]', `inst-${appRef}-${no}`);
+  params.set('properties[installment_no]', String(no));
+  params.set('properties[applicant_email]', plan.email);
+  return `https://${shop}/cart/add?${params.toString()}`;
+}
+
+/** Find an installment by its `installment_ref` and mark it paid. */
+async function markInstallmentPaid(env: Env, ref: string, no: number, orderId: string, paidAt?: string): Promise<{ ok: boolean; plan?: InstallmentPlan; completed?: boolean; error?: string }> {
+  const plan = await getInstallmentPlan(env, ref);
+  if (!plan) return { ok: false, error: 'no installment plan' };
+  const inst = plan.installments.find((x) => x.no === no);
+  if (!inst) return { ok: false, error: 'installment not found' };
+  if (inst.status === 'PAID') return { ok: true, plan, completed: false };
+  inst.status = 'PAID';
+  inst.paidAt = paidAt || new Date().toISOString();
+  inst.orderId = orderId;
+  inst.reminderStage = 6;
+  const allPaid = plan.installments.every((x) => x.status === 'PAID');
+  if (allPaid) plan.status = 'COMPLETED';
+  else plan.status = plan.status === 'SUSPENDED' ? 'ACTIVE' : 'ACTIVE';
+  await saveInstallmentPlan(env, plan);
+  // Broadcast the payment across the ecosystem (Notion, Airtable, hub, GitHub, KB).
+  try {
+    await broadcastInstallment(env, plan, allPaid ? 'completed' : 'paid');
+  } catch { /* best-effort */ }
+  return { ok: true, plan, completed: allPaid };
+}
+
+/** Serialize a plan for API/UI consumption (never expose internal reminder state). */
+function planPublicView(plan: InstallmentPlan): Record<string, unknown> {
+  return {
+    ref: plan.ref,
+    plan: plan.plan,
+    total: plan.total,
+    status: plan.status,
+    createdAt: plan.createdAt,
+    suspendedAt: plan.suspendedAt,
+    installments: plan.installments.map((i) => ({
+      no: i.no, label: i.label, amount: i.amount, dueAt: i.dueAt, status: i.status, paidAt: i.paidAt,
+    })),
+  };
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * ACCESS CAPABILITIES — the BUILD Ticket is a 14-day limited-access
+ * resource: partners build with our tools during the sprint, but full
+ * DEPLOY / LAUNCH / MARKETING unlock only after FULL payment.
+ *   · paid fully   → deploy, launch, marketing unlocked (14-day sprint)
+ *   · current plan → building resources unlocked; deploy/launch/marketing
+ *                    gated until the balance is settled
+ *   · suspended    → everything gated EXCEPT the Second Brain public link
+ * ───────────────────────────────────────────────────────────────────── */
+interface AccessCapabilities {
+  level: 'full' | 'building' | 'suspended';
+  deploy: boolean;
+  launch: boolean;
+  marketing: boolean;
+  buildResources: boolean;
+  secondBrainPublic: boolean;
+  secondBrainUrl: string;
+}
+
+function computeAccessCapabilities(paymentStatus: string | undefined, planStatus: string | undefined): AccessCapabilities {
+  const secondBrainUrl = 'https://fadil369.notion.site/Ultimate-Brain-3bc3479c6f628177afd7fb7e9224c19c';
+  const fullyPaid = planStatus === 'COMPLETED' || paymentStatus === 'Paid';
+  const suspended = planStatus === 'SUSPENDED';
+  if (fullyPaid) {
+    return { level: 'full', deploy: true, launch: true, marketing: true, buildResources: true, secondBrainPublic: true, secondBrainUrl };
+  }
+  if (suspended) {
+    // Suspended: no deploy / no launch / no marketing until full payment.
+    // The Second Brain template stays shareable via its public Notion link.
+    return { level: 'suspended', deploy: false, launch: false, marketing: false, buildResources: false, secondBrainPublic: true, secondBrainUrl };
+  }
+  // Current on installments (or one-time unpaid): building resources for the
+  // 14-day sprint are available, but deploy/launch/marketing are gated.
+  return { level: 'building', deploy: false, launch: false, marketing: false, buildResources: true, secondBrainPublic: true, secondBrainUrl };
+}
+
+/** Fetch the installment plan status for an application ref (if any). */
+async function planStatusForRef(env: Env, appRef: string): Promise<string | undefined> {
+  try {
+    const plan = await getInstallmentPlan(env, appRef);
+    return plan?.status;
+  } catch { return undefined; }
+}
+
+/** Send an installment reminder via email + SMS (best-effort). */
+async function sendInstallmentReminder(env: Env, plan: InstallmentPlan, inst: Installment, stage: number): Promise<void> {
+  const daysOver = Math.max(0, Math.floor((Date.now() - new Date(inst.dueAt).getTime()) / 86400000));
+  const paymentUrl = installmentPaymentUrl(env, plan.ref, plan, inst.no);
+  const subject = stage <= 2
+    ? (plan.plan === 'full' ? 'Your BrainSAIT BUILD Ticket payment' : `BUILD Ticket — ${inst.label} due`)
+    : `⚠️ ${inst.label} overdue — action required`;
+
+  const messages: Record<number, { title: string; body: string }> = {
+    0: { title: 'Reminder', body: `This is a friendly reminder that your ${inst.label} (SAR ${inst.amount}) is due on ${inst.dueAt.slice(0, 10)}.` },
+    1: { title: 'Payment due tomorrow', body: `Your ${inst.label} of SAR ${inst.amount} is due tomorrow. Please complete it to keep your BUILD access active.` },
+    2: { title: 'Payment due today', body: `Your ${inst.label} of SAR ${inst.amount} is due TODAY. Complete payment now to avoid disruption.` },
+    3: { title: 'Payment overdue', body: `Your ${inst.label} of SAR ${inst.amount} is ${daysOver} day(s) overdue. Pay now to keep your account active.` },
+    4: { title: 'Final reminder', body: `This is your FINAL reminder. Your ${inst.label} of SAR ${inst.amount} is ${daysOver} day(s) overdue. If not paid within 7 days your account will be suspended.` },
+    5: { title: 'Suspension imminent', body: `Your account will be SUSPENDED in ${Math.max(0, 14 - daysOver)} day(s) unless you settle your overdue ${inst.label} (SAR ${inst.amount}).` },
+  };
+
+  const m = messages[Math.min(stage, 5)] || messages[0];
+  const html = `<div style="font-family:system-ui,sans-serif;max-width:600px;margin:0 auto;line-height:1.6;">
+    <h2 style="color:#131320;">${m.title}</h2>
+    <p>Hi ${escapeHtml(plan.fullName || plan.email.split('@')[0])},</p>
+    <p>${m.body}</p>
+    <p><strong>Due amount:</strong> SAR ${inst.amount}<br/>
+       <strong>Due date:</strong> ${inst.dueAt.slice(0, 10)}<br/>
+       <strong>Application:</strong> ${plan.ref}</p>
+    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#e9c46a;border-radius:999px;padding:13px 30px;">
+      <a href="${paymentUrl}" style="color:#131320;text-decoration:none;font-weight:700;font-size:14px;">Pay now →</a>
+    </td></tr></table>
+    <p style="color:#666;font-size:13px;">Your BUILD access stays active while you are current on installments. Unpaid balances past 14 days trigger account suspension.</p>
+  </div>`;
+
+  if (env.RESEND_API_KEY && plan.email) {
+    try {
+      await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: env.RESEND_FROM_EMAIL || RESEND_FROM, to: plan.email, subject, html }),
+      });
+    } catch { /* best-effort */ }
+  }
+
+  // SMS (via the ecosystem hub — Twilio → KonsoleH → email fallback).
+  if (plan.phone) {
+    try {
+      await emitHubEvent(env, {
+        type: 'installment.reminder',
+        source: 'build-apply',
+        notify_sms: true,
+        sms_text: `BrainSAIT BUILD: ${m.title}. ${inst.label} SAR ${inst.amount} due ${inst.dueAt.slice(0, 10)}. Pay to keep access: ${paymentUrl}`.slice(0, 160),
+        data: { applicationId: plan.ref, installmentNo: inst.no, amount: inst.amount, stage, paymentUrl },
+      });
+    } catch { /* best-effort */ }
+  }
+}
+
+/**
+ * Daily installment sweep: escalate reminders and suspend overdue plans.
+ * Returns a summary of actions taken. Called from handleCron.
+ */
+async function runInstallmentSweep(env: Env): Promise<{ scanned: number; reminded: number; suspended: number; resumed: number }> {
+  const result = { scanned: 0, reminded: 0, suspended: 0, resumed: 0 };
+  let cursor: string | undefined;
+  do {
+    const listed = await env.APPLICATIONS.list({ prefix: 'installment:', cursor });
+    result.scanned += listed.keys.length;
+    for (const key of listed.keys) {
+      const ref = key.name.replace(/^installment:/, '');
+      const plan = await getInstallmentPlan(env, ref);
+      if (!plan || plan.status === 'COMPLETED') continue;
+      const now = Date.now();
+      let reminded = false;
+
+      for (const inst of plan.installments) {
+        if (inst.status === 'PAID') continue;
+        const dueMs = new Date(inst.dueAt).getTime();
+        const daysToDue = Math.ceil((dueMs - now) / 86400000);
+        const daysOver = Math.floor((now - dueMs) / 86400000);
+
+        // Stage the reminder.
+        let stage = 0;
+        if (daysToDue === 3) stage = 1;
+        else if (daysToDue === 1) stage = 2;
+        else if (daysToDue <= 0) stage = 3 + Math.min(2, Math.floor(daysOver / 2)); // 3,4,5
+        if (stage > inst.reminderStage) {
+          inst.reminderStage = stage;
+          await sendInstallmentReminder(env, plan, inst, stage);
+          reminded = true;
+          result.reminded++;
+        }
+
+        // SUSPEND at ≥14 days overdue.
+        if (daysOver >= 14 && plan.status === 'ACTIVE') {
+          plan.status = 'SUSPENDED';
+          plan.suspendedAt = new Date().toISOString();
+          plan.suspendedReason = `Installment ${inst.no} (${inst.label}) ${daysOver} days overdue`;
+          await suspendPartnerAccess(env, plan, plan.suspendedReason);
+          result.suspended++;
+          // Full ecosystem broadcast: Notion, Airtable, hub (Telegram/SMS/n8n), GitHub revoke, KB.
+          await broadcastInstallment(env, plan, 'suspended', plan.suspendedReason);
+        }
+      }
+      await saveInstallmentPlan(env, plan);
+      if (reminded) {
+        await emitHubEvent(env, {
+          type: 'installment.reminder',
+          source: 'build-apply',
+          data: { applicationId: plan.ref, reminded: true },
+        });
+      }
+    }
+    cursor = (listed as any).cursor;
+  } while (cursor);
+  return result;
+}
+
+/** Suspend (or re-activate) a partner's access across the ecosystem. */
+async function suspendPartnerAccess(env: Env, plan: InstallmentPlan, reason: string, suspend = true): Promise<void> {
+  try {
+    await fetch('https://portal.brainsait.de/api/integration/partner-status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: plan.email,
+        status: suspend ? 'suspended' : 'active',
+        reason,
+        applicationId: plan.ref,
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch { /* best-effort */ }
+
+  // Also flip the Notion candidate page to a Suspended badge (if we can find it).
+  try {
+    const found = await findApplicationByRef(env, plan.ref);
+    if (found?.id && env.NOTION_TOKEN) {
+      await notionRequest(env, 'PATCH', `/pages/${found.id}`, {
+        properties: {
+          'Badges': { multi_select: [{ name: suspend ? 'Suspended' : 'Activated' }] },
+          'Last Activity': { date: { start: new Date().toISOString() } },
+        },
+      });
+    }
+  } catch { /* best-effort */ }
+
+  await emitHubEvent(env, {
+    type: suspend ? 'partner.suspended' : 'partner.resumed',
+    source: 'build-apply',
+    data: { applicationId: plan.ref, email: plan.email, reason },
+  });
 }
 
 interface PricingTier {
@@ -102,13 +475,39 @@ const ORIGINAL_PRICE = 14960; // SAR — standard price before launch offer
 
 // Second Brain gift + companion links used in the premium paid email.
 const SECOND_BRAIN_URL = 'https://fadil369.notion.site/Ultimate-Brain-3bc3479c6f628177afd7fb7e9224c19c';
-const FORGE_BOT_URL = 'https://t.me/BrainSAITForgeBot';
+const FOUNDER_OS_URL = 'https://fadil369.notion.site/Founder-OS-3ba3479c6f628117966fd1be6c120ac2';
+const ULTIMATE_BRAIN_BUILD_URL = 'https://fadil369.notion.site/Ultimate-Brain-30b3479c6f62801083b8ce6842e5df45';
+const CALENDAR_URL = 'https://calendar.app.google/rAqiE6pNumtECdnd7';
 const ACCOUNT_URL = 'https://account.brainsait.org';
 const BUILD_TRACK_URL = 'https://fadil369.github.io/track';
 const BUILD_CERT_BASE = 'https://build-apply.brainsait.org';
+const GITHUB_PROFILE_URL = 'https://github.com';
+
+// All transactional mail is sent from the verified Resend domain. Verified
+// working sender (2026-08-14, confirmed delivered to Gmail):
+//   orders@brainsait.org  (brainsait.org is verified in Resend)
+//
+// NOTE: "resend.brainsait.org" is NOT verified in Resend — only its click-
+// tracking CNAME (links1.resend-dns.com) exists in DNS; the DKIM TXT record
+// (resend._domainkey.resend.brainsait.org) has not been added, and the
+// Resend dashboard/API cannot produce it with the send-only keys available.
+// It is NOT used as a sender until its DKIM is added and Resend marks the
+// domain verified. Sending to fadil@brainsait.org is additionally blocked by
+// Apple iCloud's forwarding policy (554 HM08) — brainsait.org mail routes to
+// iCloud via Cloudflare Email Routing, and Apple rejects externally-sent
+// messages forwarded into that mailbox. Use a real inbox for ops reports.
+const RESEND_FROM = 'BrainSAIT <orders@brainsait.org>';
+
+// Airtable mirror — "Build Candidates" table in the brainsait base
+// (appE7sxyyLHrCQBSe / tblGLOozm8LcUeXCD). Gated on secrets so the worker
+// runs identically with or without Airtable configured.
+const AIRTABLE_BASE = 'appE7sxyyLHrCQBSe';
+const AIRTABLE_CANDIDATES = 'tblGLOozm8LcUeXCD';
 
 // Launch promo codes — validated server-side. The storefront previews the
-// same codes via pricingEngine.ts; Shopify checkout applies the code.
+// same codes via pricingEngine.ts; Shopify checkout applies the code. These
+// discount codes are ACTIVE in the store (verified 2026-08-14, via the app's
+// expanded write_discounts scope).
 const PROMO_CODES: Record<string, { discountPercent: number }> = {
   LAUNCH10: { discountPercent: 10 },
   FOUNDER15: { discountPercent: 15 },
@@ -176,16 +575,15 @@ const TIERS: Record<string, PricingTier> = {
 };
 
 // FLAT launch pricing: all applicants are charged the single 9,630 SAR
-// standard variant of the storefront BUILD ticket product.
+// standard variant of the BUILD Ticket product. Verified live 2026-08-14:
+// product "BUILD Ticket — Incubation Pass" (handle build-ticket) carries
+// exactly one ACTIVE variant (BSP-BUILD-TICKET-IDENTITY @ 9,630 SAR); the
+// obsolete tiered product "brainsait-incubation-program" is archived.
 const SHOPIFY_VARIANTS: Record<string, string> = {
   standard: '45947217870931',
 };
 
 const FOUNDER_OS_TRACKS: Record<string, { name: string; url: string }> = {
-  sa_sd_free: { name: 'Saudi Founder Track', url: 'https://app.notion.com/p/3ba3479c6f62816aa985dd525c4b0beb' },
-  healthcare_50: { name: 'Healthcare Builders', url: 'https://app.notion.com/p/3ba3479c6f62812aafb8e61f1e0eea75' },
-  warrior_35: { name: 'Warrior Entrepreneurs', url: 'https://app.notion.com/p/3ba3479c6f62812aafb8e61f1e0eea75' },
-  academic_30: { name: 'Research & Academic', url: 'https://app.notion.com/p/3ba3479c6f6281f9b3c7c2b59e4306dc' },
   standard: { name: 'Founder Accelerator', url: 'https://app.notion.com/p/3ba3479c6f62812aafb8e61f1e0eea75' },
 };
 
@@ -265,7 +663,8 @@ function calculatePrice(data: EligibilityData, promoCode?: string): PricingResul
   // Launch pricing is FLAT: every BUILD seat is SAR 9,630 (was SAR 14,960).
   // Identity and profession are still collected (stored in Notion) for cohort
   // routing and CRM, but no longer change the price. A valid promo code adds
-  // a discount on top of the launch price.
+  // a discount on top of the launch price — codes LAUNCH10 (10%) and
+  // FOUNDER15 (15%) are ACTIVE in the store.
   const tier = TIERS.standard;
   const promo = lookupPromo(promoCode);
   const promoDiscount = promo ? promo.discountPercent : 0;
@@ -444,9 +843,7 @@ async function sendConfirmationEmail(
 
   const ar = payload.lang === 'ar';
   const tierTitle = ar ? pricing.tier.titleAr : pricing.tier.titleEn;
-  const priceText = pricing.finalPrice === 0
-    ? (ar ? 'مجاني' : 'FREE')
-    : `${pricing.finalPrice.toLocaleString(ar ? 'ar-SA' : 'en-SA')} SAR`;
+  const priceText = `${pricing.finalPrice.toLocaleString(ar ? 'ar-SA' : 'en-SA')} SAR`;
   const promoLine = pricing.promoCode
     ? ar
       ? `<li><strong>رمز الخصم المطبق:</strong> ${pricing.promoCode} — خصم ${pricing.discount}%</li>`
@@ -463,31 +860,33 @@ async function sendConfirmationEmail(
   const html = ar
     ? `<div dir="rtl" style="font-family:system-ui,sans-serif;max-width:600px;margin:0 auto;line-height:1.6;">
         <h2 style="color:#131320;">مرحباً ${escapeHtml(payload.fullName)} 👋</h2>
-        <p>استلمنا طلبك بنجاح. إليك ملخص الاستحقاق:</p>
+        <p>استلمنا طلبك بنجاح. إليك ملخص تذكرة البناء:</p>
         <ul>
-          <li><strong>فئة الاستحقاق:</strong> ${escapeHtml(tierTitle)}</li>
+          <li><strong>التذكرة:</strong> ${escapeHtml(tierTitle)} — سعر موحد للجميع</li>
           ${originalLine}
           <li><strong>السعر النهائي:</strong> ${priceText}</li>
-          ${promoLine}
           <li><strong>رقم الطلب:</strong> ${appRef}</li>
+          ${promoLine}
         </ul>
         <p style="margin:1rem 0;"><a href="${SMART_MATCHER_URL}">اكتشف مسارك الأمثل عبر Smart Program Matcher →</a></p>
-        ${checkoutUrl ? `<p style="margin:1.5rem 0;"><a href="${checkoutUrl}" style="background:#e9c46a;color:#131320;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:700;">إتمام الدفع</a></p>` : '<p>ستتواصل معك الإدارة قريباً لتفعيل وصولك المجاني.</p>'}
-        <p style="color:#666;font-size:0.9rem;">يمكنك متابعة حالة طلبك في Notion: <a href="${notionUrl}">${notionUrl}</a></p>
+        ${checkoutUrl ? `<p style="margin:1.5rem 0;"><a href="${checkoutUrl}" style="background:#e9c46a;color:#131320;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:700;">إتمام الدفع</a></p>` : ''}
+        <p style="margin:1rem 0 0;color:#666;font-size:0.9rem;">بعد الدفع: يُفتح حسابك، صفحة الإعداد في Notion، ومستودع GitHub الخاص بك تلقائياً.</p>
+        ${notionUrl ? `<p style="color:#666;font-size:0.9rem;">يمكنك متابعة حالة طلبك في Notion: <a href="${notionUrl}">${notionUrl}</a></p>` : ''}
       </div>`
     : `<div style="font-family:system-ui,sans-serif;max-width:600px;margin:0 auto;line-height:1.6;">
         <h2 style="color:#131320;">Hi ${escapeHtml(payload.fullName)} 👋</h2>
-        <p>We received your application successfully. Here's your eligibility summary:</p>
+        <p>We received your application successfully. Here's your Build Ticket summary:</p>
         <ul>
-          <li><strong>Benefit tier:</strong> ${escapeHtml(tierTitle)}</li>
+          <li><strong>Ticket:</strong> ${escapeHtml(tierTitle)} — one flat price for everyone</li>
           ${originalLine}
           <li><strong>Final price:</strong> ${priceText}</li>
-          ${promoLine}
           <li><strong>Application ref:</strong> ${appRef}</li>
+          ${promoLine}
         </ul>
         <p style="margin:1rem 0;"><a href="${SMART_MATCHER_URL}">Find your best path with the Smart Program Matcher →</a></p>
-        ${checkoutUrl ? `<p style="margin:1.5rem 0;"><a href="${checkoutUrl}" style="background:#e9c46a;color:#131320;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:700;">Complete payment</a></p>` : '<p>Our team will reach out shortly to activate your free access.</p>'}
-        <p style="color:#666;font-size:0.9rem;">Track your application in Notion: <a href="${notionUrl}">${notionUrl}</a></p>
+        ${checkoutUrl ? `<p style="margin:1.5rem 0;"><a href="${checkoutUrl}" style="background:#e9c46a;color:#131320;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:700;">Complete payment</a></p>` : ''}
+        <p style="margin:1rem 0 0;color:#666;font-size:0.9rem;">After payment your customer account, Notion onboarding, and your own GitHub repo are provisioned automatically.</p>
+        ${notionUrl ? `<p style="color:#666;font-size:0.9rem;">Track your application in Notion: <a href="${notionUrl}">${notionUrl}</a></p>` : ''}
       </div>`;
 
   await fetch('https://api.resend.com/emails', {
@@ -497,7 +896,7 @@ async function sendConfirmationEmail(
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      from: env.RESEND_FROM_EMAIL || 'BrainSAIT <orders@brainsait.org>',
+      from: env.RESEND_FROM_EMAIL || RESEND_FROM,
       to: payload.email,
       subject,
       html,
@@ -548,7 +947,7 @@ async function createTask(
     name: string;
     candidateId: string;
     dueDays?: number;
-    channel?: 'Notion' | 'Email' | 'Telegram';
+    channel?: 'Notion' | 'Email' | 'Telegram' | 'GitHub';
     automated?: boolean;
     assigneeEmail?: string;
   },
@@ -606,23 +1005,18 @@ const GITHUB_TEMPLATE_REPO = 'brainsait-build-starter';
  * Give a paid candidate a real, isolated GitHub repo generated from the BUILD
  * starter template, with them invited as an outside collaborator scoped to
  * that one repo only — never org-wide. Idempotent via KV. No-ops silently
- * when no GitHub username is on file (the intake flow doesn't collect one
- * yet — this activates on its own once that field exists on the candidate).
+ * when no GitHub username is on file (the flat intake collects it at apply
+ * time; candidates who skip it can add it later on the Notion record — the
+ * webhook re-runs provisioning idempotently once it is present).
  */
 async function provisionGitHubAccess(env: Env, applicationRef: string, githubUsername?: string): Promise<void> {
   console.log(`provisionGitHubAccess called: ref=${applicationRef} username=${githubUsername || '(none)'} hasToken=${!!env.GITHUB_TOKEN}`);
-  if (!env.GITHUB_TOKEN || !githubUsername) {
-    console.log('provisionGitHubAccess: early return, missing token or username');
+  if (!env.GITHUB_TOKEN) {
+    console.log('provisionGitHubAccess: early return, missing token');
     return;
   }
 
   const dedupKey = `github-provisioned:${applicationRef}`;
-  if (env.APPLICATIONS && (await env.APPLICATIONS.get(dedupKey))) {
-    console.log(`provisionGitHubAccess: dedup key already set for ${applicationRef}, skipping`);
-    return;
-  }
-
-  const repoName = `build-${applicationRef.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 60)}`;
   const ghHeaders = {
     Authorization: `Bearer ${env.GITHUB_TOKEN}`,
     Accept: 'application/vnd.github+json',
@@ -630,34 +1024,55 @@ async function provisionGitHubAccess(env: Env, applicationRef: string, githubUse
     'Content-Type': 'application/json',
     'User-Agent': 'brainsait-build-apply',
   };
+  const repoName = `build-${applicationRef.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 60)}`;
 
-  const createRes = await fetch(
-    `https://api.github.com/repos/${GITHUB_TEMPLATE_OWNER}/${GITHUB_TEMPLATE_REPO}/generate`,
-    {
-      method: 'POST',
-      headers: ghHeaders,
-      body: JSON.stringify({ owner: GITHUB_TEMPLATE_OWNER, name: repoName, private: false, include_all_branches: false }),
-    },
-  );
-  if (!createRes.ok) {
-    console.error(`GitHub repo generate failed for ${applicationRef}: ${createRes.status} ${await createRes.text()}`);
-    return;
+  // If a repo was already provisioned, only fall through to a *late invite* when
+  // the applicant supplied a username after the fact. Otherwise fully idempotent.
+  const existing = env.APPLICATIONS
+    ? ((await env.APPLICATIONS.get(dedupKey, 'json')) as { repoUrl?: string; githubUsername?: string } | null)
+    : null;
+
+  let repo = { html_url: '', full_name: '' };
+  if (existing?.repoUrl) {
+    repo.html_url = existing.repoUrl;
+    repo.full_name = existing.repoUrl.replace(/^https?:\/\/github\.com\//, '');
+    if (!githubUsername || (existing.githubUsername && existing.githubUsername === githubUsername)) {
+      console.log(`provisionGitHubAccess: repo already provisioned for ${applicationRef}, skipping`);
+      return;
+    }
+  } else {
+    const createRes = await fetch(
+      `https://api.github.com/repos/${GITHUB_TEMPLATE_OWNER}/${GITHUB_TEMPLATE_REPO}/generate`,
+      {
+        method: 'POST',
+        headers: ghHeaders,
+        body: JSON.stringify({ owner: GITHUB_TEMPLATE_OWNER, name: repoName, private: false, include_all_branches: false }),
+      },
+    );
+    if (!createRes.ok) {
+      console.error(`GitHub repo generate failed for ${applicationRef}: ${createRes.status} ${await createRes.text()}`);
+      return;
+    }
+    repo = (await createRes.json()) as { html_url: string; full_name: string };
   }
-  const repo = (await createRes.json()) as { html_url: string; full_name: string };
 
-  const inviteRes = await fetch(
-    `https://api.github.com/repos/${repo.full_name}/collaborators/${encodeURIComponent(githubUsername)}`,
-    { method: 'PUT', headers: ghHeaders, body: JSON.stringify({ permission: 'push' }) },
-  );
-  if (!inviteRes.ok) {
-    console.error(`GitHub collaborator invite failed for ${applicationRef} -> ${githubUsername}: ${inviteRes.status}`);
-    // Repo exists even if the invite failed; still record it so we don't re-create on retry.
+  if (githubUsername) {
+    const inviteRes = await fetch(
+      `https://api.github.com/repos/${repo.full_name}/collaborators/${encodeURIComponent(githubUsername)}`,
+      { method: 'PUT', headers: ghHeaders, body: JSON.stringify({ permission: 'push' }) },
+    );
+    if (!inviteRes.ok) {
+      console.error(`GitHub collaborator invite failed for ${applicationRef} -> ${githubUsername}: ${inviteRes.status}`);
+      // Repo exists even if the invite failed; still record it so we don't re-create on retry.
+    }
+  } else {
+    console.log(`provisionGitHubAccess: repo ${repo.full_name} ready; no githubUsername yet — invite deferred`);
   }
 
-  if (env.APPLICATIONS) {
+  if (env.APPLICATIONS && repo.html_url) {
     await env.APPLICATIONS.put(
       dedupKey,
-      JSON.stringify({ repoUrl: repo.html_url, githubUsername, provisionedAt: new Date().toISOString() }),
+      JSON.stringify({ repoUrl: repo.html_url, githubUsername: githubUsername || null, provisionedAt: new Date().toISOString() }),
     );
   }
 }
@@ -738,7 +1153,7 @@ function kvInitialTasks(): KvTask[] {
 function kvOnboardingTasks(env: Env): KvTask[] {
   return [
     { name: 'Create cohort & sprint plan', status: 'To Do', channel: 'Notion' },
-    { name: 'Invite to Telegram Forge Bot', status: 'To Do', channel: 'Telegram' },
+    { name: 'Invite to GitHub repository', status: 'To Do', channel: 'GitHub' },
     { name: 'Schedule onboarding call', status: 'To Do', channel: 'Email' },
   ];
 }
@@ -775,6 +1190,116 @@ async function kvPut(env: Env, app: KvApplication): Promise<void> {
   } catch { /* ignore */ }
 }
 
+/* ─────────────────────────────────────────────────────────────────────
+ * D1 CENTRAL STUDENT STATE — the single source of truth for partner state
+ * across the whole ecosystem (Telegram, email, simulator, admin dashboard).
+ * Falls back gracefully when D1 is not configured; all existing KV/Notion
+ * flows continue to work independently.
+ * ───────────────────────────────────────────────────────────────────── */
+
+/** Upsert a student record in the central D1 database.
+ *  Keys email-normalized so lookups are case‑insensitive.
+ */
+async function d1UpsertStudent(env: Env, email: string, data: Record<string, string | number | boolean | null>): Promise<void> {
+  const norm = email.toLowerCase();
+  const now = new Date().toISOString();
+  const keys = Object.keys(data);
+  if (keys.length === 0) return;
+  const cols = keys.join(', ');
+  const placeholders = keys.map(() => '?').join(', ');
+  const values = keys.map((k) => data[k]);
+  const updates = keys.map((k) => `${k}=excluded.${k}`).join(', ');
+  try {
+    await env.BUILD_DB.prepare(
+      `INSERT INTO students (email, ${cols}, created_at, updated_at) VALUES (?, ${placeholders}, ?, ?)
+       ON CONFLICT(email) DO UPDATE SET ${updates}, updated_at=excluded.updated_at`
+    ).bind(norm, ...values, now, now).run();
+  } catch { /* best-effort — KV/Notion remain authoritative */ }
+  // Also update KV for backward compatibility (best-effort).
+  try {
+    const existing = await env.APPLICATIONS.get(`student:${norm}`, 'json');
+    if (existing) { Object.assign(existing, data); await env.APPLICATIONS.put(`student:${norm}`, JSON.stringify(existing)); }
+    else await env.APPLICATIONS.put(`student:${norm}`, JSON.stringify({ email: norm, ...data, updatedAt: now }));
+  } catch { /* best-effort */ }
+}
+
+/** Read a student record from the central D1 database. */
+async function d1GetStudent(env: Env, email: string): Promise<Record<string, unknown> | null> {
+  const norm = email.toLowerCase();
+  try {
+    const row = await env.BUILD_DB.prepare(`SELECT * FROM students WHERE email = ?`).bind(norm).all();
+    const results = (row as { results?: Record<string, unknown>[] }).results || [];
+    return results.length ? results[0] : null;
+  } catch { return null; }
+}
+
+/** Log an ecosystem event (Telegram start, simulator screenshot, day complete, etc.)
+ *  into the central D1 events table, then fire a best‑effort async fan‑out via
+ *  ctx.waitUntil so the caller's response is never blocked on side effects.
+ */
+async function d1LogEvent(ctx: ExecutionContext, env: Env, eventType: string, studentEmail: string, payload: Record<string, unknown>): Promise<void> {
+  const now = new Date().toISOString();
+  try {
+    await env.BUILD_DB.prepare(
+      `INSERT INTO events (event_type, student_email, payload, created_at) VALUES (?, ?, ?, ?)`
+    ).bind(eventType, studentEmail.toLowerCase(), JSON.stringify(payload), now).run();
+  } catch { /* best-effort */ }
+  // Async fan‑out via waitUntil — don't block the request.
+  ctx.waitUntil(fanoutEvent(env, eventType, studentEmail, payload));
+}
+
+/** Fan‑out a single ecosystem event so all subsystems can react. */
+async function fanoutEvent(env: Env, eventType: string, studentEmail: string, payload: Record<string, unknown>): Promise<void> {
+  // 1. Notion — append a note to the candidate page (if configured)
+  try {
+    if (!env.NOTION_TOKEN || !env.NOTION_BUILD_DB_ID) return;
+    const candidate = await findApplicationByRef(env, studentEmail);
+    if (!candidate?.id) return;
+    const lines = [
+      `🔔 ${eventType.replace('.', ' ')} — ${new Date().toISOString()}`,
+      ...(payload && Object.keys(payload).length ? Object.entries(payload).map(([k, v]) => `• ${k}: ${String(v)}`) : []).join('\n'),
+    ].filter(Boolean).join('\n');
+    await notionRequest(env, 'PATCH', `/pages/${candidate.id}`, {
+      properties: {
+        'Last Activity': { date: { start: new Date().toISOString() } },
+        Notes: { rich_text: [{ text: { content: lines } }] },
+      },
+    });
+  } catch { /* best-effort */ }
+
+  // 2. Hub event bus — Telegram / SMS / n8n react to every event.
+  try {
+    const base = env.HUB_URL || 'https://brainsait.de';
+    await fetch(`${base}/api/event`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Hub-Key': env.HUB_KEY || '' },
+      body: JSON.stringify({ type: eventType, source: 'build-apply', data: { studentEmail, payload } }),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch { /* best-effort */ }
+
+  // 3. Telegram — send a contextual message (welcome, day content, certificate).
+  try {
+    if (!env.TELEGRAM_BOT_TOKEN) return;
+    const student = await d1GetStudent(env, studentEmail);
+    const chatId = student?.telegram_chat_id;
+    if (!chatId) return;
+    const appRef = String(student?.applicationRef || student?.ref || '');
+    const trackUrl = `${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}`;
+    const lines = [
+      `🔔 ${eventType.replace('.', ' ')}`,
+      trackUrl ? `📊 ${trackUrl}` : '',
+    ].filter(Boolean).join('\n');
+    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: lines, parse_mode: 'HTML', disable_web_page_preview: true }),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch { /* best-effort */ }
+}
+/* ───────────────────────────────────────────────────────────────────── */
+
 function kvBadges(tasks: KvTask[]): string[] {
   const done = tasks.filter((t) => t.status === 'Done').length;
   const badges: string[] = [];
@@ -787,17 +1312,18 @@ function kvBadges(tasks: KvTask[]): string[] {
 }
 
 function kvProgress(app: KvApplication): ProgressInfo {
-  const totalTasks = app.tasks.length;
-  const doneTasks = app.tasks.filter((t) => t.status === 'Done').length;
+  const tasks = app.tasks || [];
+  const totalTasks = tasks.length;
+  const doneTasks = tasks.filter((t) => t.status === 'Done').length;
   const percent = totalTasks > 0 ? doneTasks / totalTasks : 0;
   return {
     totalTasks,
     doneTasks,
     percent,
-    badges: kvBadges(app.tasks),
-    tasks: app.tasks.map((t) => ({ name: t.name, status: t.status, channel: t.channel })),
+    badges: kvBadges(tasks),
+    tasks: tasks.map((t) => ({ name: t.name, status: t.status, channel: t.channel })),
     milestones: [],
-    nextTask: app.tasks.find((t) => t.status !== 'Done')?.name || null,
+    nextTask: tasks.find((t) => t.status !== 'Done')?.name || null,
   };
 }
 
@@ -813,6 +1339,96 @@ async function emitHubEvent(env: Env, evt: Record<string, unknown>): Promise<voi
       signal: AbortSignal.timeout(8000),
     });
   } catch { /* best-effort */ }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Airtable mirror — keeps an always-current "Build Candidates" record for
+ * every applicant (created at apply time, updated on payment). Best-effort:
+ * never throws; only active when AIRTABLE_API_KEY/BASE_ID/TABLE are set.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+interface AirtableCandidate {
+  fullName: string;
+  email: string;
+  phone?: string;
+  country?: string;
+  githubUsername?: string;
+  appRef: string;
+  tier: string;
+  finalPrice: number;
+  paymentStatus: string;
+  applicationStatus: string;
+  track: string;
+  notionUrl?: string;
+}
+
+async function airtableConfigured(env: Env): Promise<boolean> {
+  return !!env.AIRTABLE_API_KEY && !!env.AIRTABLE_BASE_ID && !!env.AIRTABLE_CANDIDATES_TABLE;
+}
+
+async function airtableRequest(env: Env, method: string, path: string, body?: unknown): Promise<any> {
+  const res = await fetch(`https://api.airtable.com/v0${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${env.AIRTABLE_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return res.json();
+}
+
+async function findAirtableRecord(env: Env, appRef: string): Promise<string | null> {
+  if (!(await airtableConfigured(env))) return null;
+  try {
+    const data = await airtableRequest(
+      env,
+      'GET',
+      `/${env.AIRTABLE_BASE_ID}/${env.AIRTABLE_CANDIDATES_TABLE}?filterByFormula=${encodeURIComponent(`{Application Ref}="${appRef}"`)}&maxRecords=1`,
+    );
+    return data?.records?.[0]?.id || null;
+  } catch { return null; }
+}
+
+async function syncAirtableCandidate(env: Env, c: AirtableCandidate): Promise<{ ok: boolean; action?: string; recordId?: string; error?: string }> {
+  if (!(await airtableConfigured(env))) return { ok: false, error: 'airtable not configured' };
+  const now = new Date().toISOString();
+  const fields: Record<string, unknown> = {
+    'Name': c.fullName || 'Founder',
+    'Email': c.email,
+    'Phone': c.phone || undefined,
+    'Country': c.country || undefined,
+    'GitHub Username': c.githubUsername || undefined,
+    'Application Ref': c.appRef,
+    'Tier': c.tier,
+    'Final Price': c.finalPrice,
+    'Payment Status': c.paymentStatus,
+    'Application Status': c.applicationStatus,
+    'Track': c.track,
+    'Notion URL': c.notionUrl || undefined,
+    'Submitted At': c.paymentStatus === 'Pending' ? now : undefined,
+    'Last Updated': now,
+  };
+  const clean: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(fields)) if (v !== undefined) clean[k] = v;
+
+  const existingId = await findAirtableRecord(env, c.appRef);
+  try {
+    if (existingId) {
+      const res = await airtableRequest(env, 'PATCH', `/${env.AIRTABLE_BASE_ID}/${env.AIRTABLE_CANDIDATES_TABLE}`, {
+        records: [{ id: existingId, fields: clean }],
+      });
+      if (res?.records?.[0]) return { ok: true, action: 'updated', recordId: existingId };
+      return { ok: false, error: JSON.stringify(res).slice(0, 300) };
+    }
+    const res = await airtableRequest(env, 'POST', `/${env.AIRTABLE_BASE_ID}/${env.AIRTABLE_CANDIDATES_TABLE}`, {
+      records: [{ fields: clean }],
+    });
+    if (res?.records?.[0]) return { ok: true, action: 'created', recordId: res.records[0].id };
+    return { ok: false, error: JSON.stringify(res).slice(0, 300) };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
 }
 
 async function findApplicationByRef(env: Env, appRef: string): Promise<{ id: string; properties: any; kv?: KvApplication; url?: string } | null> {
@@ -834,8 +1450,8 @@ async function createOnboardingPlan(env: Env, candidateId: string, payload: Appl
   if (!(await taskExists(env, candidateId, 'Create cohort & sprint plan'))) {
     await createTask(env, { name: 'Create cohort & sprint plan', candidateId, dueDays: 0, channel: 'Notion' });
   }
-  if (!(await taskExists(env, candidateId, 'Invite to Telegram Forge Bot'))) {
-    await createTask(env, { name: 'Invite to Telegram Forge Bot', candidateId, dueDays: 0, channel: 'Telegram', automated: true });
+  if (!(await taskExists(env, candidateId, 'Invite to GitHub repository'))) {
+    await createTask(env, { name: 'Invite to GitHub repository', candidateId, dueDays: 0, channel: 'GitHub', automated: true });
   }
   if (!(await taskExists(env, candidateId, 'Schedule onboarding call'))) {
     await createTask(env, { name: 'Schedule onboarding call', candidateId, dueDays: 1, channel: 'Email' });
@@ -878,11 +1494,60 @@ async function verifyShopifyHmac(body: string, hmac: string, secret: string): Pr
   return computed === hmac;
 }
 
+/**
+ * INSTALLMENT PAYMENT handling shared by the webhook AND the reliability
+ * sweep. Returns a Response when the order is a *non-final* installment
+ * payment (acknowledge without full approval), or `null` to fall through to
+ * the full paid-provisioning path (final installment, or no installment
+ * marker at all). Without this the sweep would approve a partner after a
+ * single partial payment.
+ */
+async function handleInstallmentPayment(
+  env: Env,
+  order: any,
+  itemProps: any[],
+  topProps: any[],
+  appRef: string,
+): Promise<Response | null> {
+  const findRef = (list: any[]) => {
+    const attr = list.find((a: any) => a.name === 'application_ref' || a.name === 'applicationRef');
+    return attr?.value ?? attr?.application_ref ?? null;
+  };
+  const instRef = findRef(itemProps) || findRef(topProps) || '';
+  const instNoMatch = (() => {
+    const all = [...itemProps, ...topProps];
+    const m = all.find((a: any) => a.name === 'installment_no');
+    return m?.value ? Number(m.value) : NaN;
+  })();
+
+  if (!instRef || !appRef || Number.isNaN(instNoMatch)) return null;
+
+  const orderGid = String(order.admin_graphql_api_id || order.id || '');
+  const res = await markInstallmentPaid(env, appRef, instNoMatch, orderGid, order.updated_at || new Date().toISOString());
+  if (res.ok && res.plan && res.completed) {
+    // Final installment → the application becomes fully Paid + Approved and
+    // the normal paid-provisioning continues below (fall through).
+    return null;
+  }
+  if (res.ok && res.plan) {
+    // Partial payment recorded. Acknowledge — no full approval yet.
+    await emitHubEvent(env, {
+      type: 'installment.paid',
+      source: 'build-apply',
+      data: { applicationId: appRef, installmentNo: instNoMatch, email: String(order.email || order.contact_email || '') },
+    });
+    return jsonResponse({ ok: true, applicationId: appRef, status: `installment ${instNoMatch} paid`, installment: true }, 200, null);
+  }
+  // If the plan is unknown/errored, fall through to the normal path safely.
+  return null;
+}
+
 async function handleShopifyWebhook(request: Request, env: Env): Promise<Response> {
   const origin = request.headers.get('origin');
   const body = await request.text();
   const hmac = request.headers.get('x-shopify-hmac-sha256') || '';
   const topic = request.headers.get('x-shopify-topic') || '';
+  console.log(`webhook received: topic=${topic} hmac=${hmac.slice(0, 12)}… bodyLen=${body.length}`);
 
   // The webhook secret is mandatory: without it every forged request would be
   // trusted as a genuine "paid" event and applicants could be approved without
@@ -940,12 +1605,23 @@ async function handleShopifyWebhook(request: Request, env: Env): Promise<Respons
   };
   const appRef = findRef(attrs) || findRef(itemProps) || findRef(topProps);
 
+  // INSTALLMENT PAYMENT: if the order carries an installment marker, record
+  // that single installment as paid. The application is only fully approved
+  // when every installment is settled (final installment falls through to
+  // full provisioning below).
+  const instRes = await handleInstallmentPayment(env, order, itemProps, topProps, appRef);
+  if (instRes) return instRes;
+
   if (!appRef) {
     // Genuine Shopify order that is not a BUILD ticket (e.g. regular store
     // purchase). Acknowledge so Shopify stops retrying.
     return jsonResponse({ ok: true, ignored: true, reason: 'not a BUILD order' }, 200, origin);
   }
 
+  return await provisionPaidApplication(env, order, appRef, origin);
+}
+
+async function provisionPaidApplication(env: Env, order: any, appRef: string, origin: string | null): Promise<Response> {
   const candidate = await findApplicationByRef(env, appRef);
   if (!candidate) {
     return jsonResponse({ ok: false, error: 'Application not found' }, 404, origin);
@@ -985,6 +1661,7 @@ async function handleShopifyWebhook(request: Request, env: Env): Promise<Respons
       identity: app.identity || 'OTHER',
       country: app.country || '',
       phone: app.phone || '',
+      githubUsername: app.githubUsername,
     };
   } else {
     await notionRequest(env, 'PATCH', `/pages/${candidate.id}`, {
@@ -1020,11 +1697,12 @@ async function handleShopifyWebhook(request: Request, env: Env): Promise<Respons
   try { await checkAndIssueCertificate(env, candidate, appRef); } catch { /* best-effort */ }
 
   // Real, isolated GitHub repo per paid candidate — Phase 1 of the BUILD
-  // access model. No-ops until a "GitHub Username" field exists on the
-  // candidate; see BUILD Access Architecture for why this is the one
-  // Tier-1 item that's actually provisionable via API today.
+  // access model. Uses the GitHub username collected at intake; works for both
+  // Notion-backed and KV-backed applications.
+  const githubUsername = candidate?.kv
+    ? candidate.kv.githubUsername
+    : candidate?.properties?.['GitHub Username']?.rich_text?.[0]?.plain_text;
   try {
-    const githubUsername = candidate?.properties?.['GitHub Username']?.rich_text?.[0]?.plain_text;
     console.log(`Webhook call site: candidate.kv=${!!candidate?.kv} githubUsername=${githubUsername || '(none)'}`);
     await provisionGitHubAccess(env, appRef, githubUsername);
   } catch (err) {
@@ -1048,7 +1726,7 @@ async function handleShopifyWebhook(request: Request, env: Env): Promise<Respons
       country: payload.country || '',
       applicationRef: appRef,
       acceptsMarketing: true,
-      tags: ['build-partner', 'paid', 'partner-profile'],
+      tags: ['build-partner', 'super-partner', 'paid', 'partner-profile'],
     }, true);
   } catch { /* non-fatal */ }
 
@@ -1058,10 +1736,138 @@ async function handleShopifyWebhook(request: Request, env: Env): Promise<Respons
     } catch { /* best-effort */ }
   }
 
+  // Personal Telegram onboarding: private welcome with the Founder OS course,
+  // the BUILD 2nd Brain, the GitHub repo and the cohort invite link.
+  const telegramId = candidate?.kv
+    ? candidate.kv.telegramId
+    : candidate?.properties?.['Telegram ID']?.rich_text?.[0]?.plain_text;
+  try {
+    await sendTelegramWelcome(env, {
+      telegramId: telegramId || '',
+      fullName: payload.fullName || 'Founder',
+      appRef,
+      githubUsername: githubUsername || '',
+    });
+  } catch (err) { console.error(`sendTelegramWelcome failed for ${appRef}: ${err}`); }
+
+  // SUPER PARTNER SUITE: fulfillment record, welcome gift card, B2B company,
+  // and analytics annotation — all idempotent + best-effort. Uses the paid
+  // order id so the partner's order is marked fulfilled with the onboarding kit.
+  let superResults: Record<string, any> = {};
+  try {
+    const orderId = String(order.admin_graphql_api_id || order.id || '');
+    if (orderId && payload.email) {
+      const prov = await provisionSuperPartner(env, {
+        orderId,
+        email: orderEmail || payload.email,
+        fullName: payload.fullName || 'Founder',
+        appRef,
+        phone: payload.phone || '',
+      });
+      superResults = prov.results || {};
+    }
+  } catch { /* non-fatal — never blocks the paid confirmation */ }
+
+  // Fan the rich provisioning event onto the ecosystem event bus so the
+  // portal, n8n, Hermes, Telegram and the SSE dashboard can react instantly.
+  try {
+    await emitHubEvent(env, {
+      type: 'super.partner.provisioned',
+      source: 'build-apply',
+      data: {
+        applicationId: appRef,
+        email: orderEmail || payload.email,
+        fullName: payload.fullName || 'Founder',
+        tier: 'STANDARD',
+        orderId: String(order.admin_graphql_api_id || order.id || ''),
+        fulfillmentId: superResults.fulfillment?.fulfillmentId,
+        giftCardId: superResults.giftCard?.giftCardId,
+        companyId: superResults.company?.companyId,
+        githubUsername,
+        trackUrl: `${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}`,
+        notionUrl: candidate.url || '',
+      },
+    });
+  } catch { /* best-effort */ }
+
+  // Synchronous profile write to the account portal (portal.brainsait.de) so
+  // the partner's role + Super entitlements are live immediately.
+  try {
+    await syncPartnerProfile(env, {
+      applicationId: appRef,
+      email: orderEmail || payload.email || '',
+      fullName: payload.fullName || 'Founder',
+      tier: 'STANDARD',
+      orderId: String(order.admin_graphql_api_id || order.id || ''),
+      fulfillmentId: superResults.fulfillment?.fulfillmentId || '',
+      giftCardId: superResults.giftCard?.giftCardId || '',
+      companyId: superResults.company?.companyId || '',
+      githubUsername: githubUsername || '',
+      trackUrl: `${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}`,
+      notionUrl: candidate.url || '',
+    });
+  } catch { /* best-effort */ }
+
+  // Update the candidate's Notion page inside the Second Brain: add the
+  // Super Partner badge + provisioning summary so the onboarding board and
+  // milestone tracking reflect the entitlements.
+  try {
+    await syncPartnerToNotion(env, {
+      candidateId: candidate?.id,
+      appRef,
+      fullName: payload.fullName || 'Founder',
+      fulfillmentId: superResults.fulfillment?.fulfillmentId,
+      giftCardId: superResults.giftCard?.giftCardId,
+      companyId: superResults.company?.companyId,
+      trackUrl: `${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}`,
+      notionUrl: candidate.url || '',
+    });
+  } catch { /* best-effort */ }
+
+  // Index the partner into the AI-searchable knowledge base (D1) so the AI
+  // gateway / RAG and ecosystem agents can find them.
+  try {
+    await embedPartnerToKb(env, {
+      applicationId: appRef,
+      email: orderEmail || payload.email || '',
+      fullName: payload.fullName || 'Founder',
+      tier: 'STANDARD',
+      orderId: String(order.admin_graphql_api_id || order.id || ''),
+      fulfillmentId: superResults.fulfillment?.fulfillmentId || '',
+      giftCardId: superResults.giftCard?.giftCardId || '',
+      companyId: superResults.company?.companyId || '',
+      githubUsername: githubUsername || '',
+      trackUrl: `${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}`,
+      notionUrl: candidate.url || '',
+    });
+  } catch { /* best-effort */ }
+
+  // Airtable mirror: flip the candidate's record to Paid + Approved so the
+  // Build Candidates ledger always reflects the live pipeline.
+  try {
+    await syncAirtableCandidate(env, {
+      fullName: payload.fullName || 'Founder',
+      email: payload.email || '',
+      phone: payload.phone || '',
+      country: payload.country || '',
+      githubUsername: candidate?.kv
+        ? candidate.kv.githubUsername
+        : candidate?.properties?.['GitHub Username']?.rich_text?.[0]?.plain_text || '',
+      appRef,
+      tier: 'STANDARD',
+      finalPrice: 9630,
+      paymentStatus: 'Paid',
+      applicationStatus: 'Approved',
+      track: 'Founder Accelerator',
+      notionUrl: candidate.url || '',
+    });
+  } catch { /* non-fatal */ }
+
   return jsonResponse({ ok: true, applicationId: appRef, status: 'paid & approved' }, 200, origin);
 }
 
 async function sendPaidWelcomeEmail(env: Env, email: string, name: string, appRef: string): Promise<void> {
+  const trackUrl = `${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}`;
   const body = `
     <p style="margin:0 0 14px;font-size:17px;color:#131320;"><b>🎉 Welcome, ${escapeHtml(name)}</b></p>
     <p style="margin:0 0 16px;">Your payment is confirmed and your seat is <b>approved</b>. You are officially a BrainSAIT partner now — and a very valuable one.</p>
@@ -1069,20 +1875,35 @@ async function sendPaidWelcomeEmail(env: Env, email: string, name: string, appRe
     <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:14px 34px;">
       <a href="${SECOND_BRAIN_URL}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:15px;">Open your Second Brain 🧠</a>
     </td></tr></table>
-    <p style="margin:0 0 10px;color:#131320;"><b>🤖 Your companion agent</b> — @BrainSAITForgeBot follows you from registration to certificate: daily standups, progress scoring, reminders, and your certificate when you complete everything.</p>
+    <p style="margin:0 0 10px;color:#131320;"><b>🚀 Your Founder OS incubator course is live</b> — from idea to company, the full founder operating system.</p>
     <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
-      <a href="${FORGE_BOT_URL}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Chat with your bot on Telegram →</a>
+      <a href="${FOUNDER_OS_URL}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Start Founder OS →</a>
+    </td></tr></table>
+    <p style="margin:0 0 10px;color:#131320;"><b>🧠 Your BUILD Ultimate Brain (2nd Brain)</b> — the Arabic incubator edition with your onboarding board, milestones and lab simulators.</p>
+    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
+      <a href="${ULTIMATE_BRAIN_BUILD_URL}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Open your BUILD 2nd Brain →</a>
+    </td></tr></table>
+    <p style="margin:0 0 10px;color:#131320;"><b>📅 Need a bigger discount or an adjusted plan?</b> <a href="${CALENDAR_URL}" style="color:#8a6d1f;">Book a 1:1 evaluation</a> — 30 minutes with the founder.</p>
+    <p style="margin:0 0 10px;color:#131320;"><b>🧑‍💻 Everything is already set up for you</b> — all automated the moment your payment landed:</p>
+    <ul style="margin:0 0 16px;padding-left:20px;color:#444;font-family:Arial,sans-serif;font-size:14px;line-height:1.8;">
+      <li><b>Notion onboarding</b> — your application page and milestone board are live, all 16 milestones seeded.</li>
+      <li><b>GitHub repo</b> — your own repository generated from the BUILD starter, with you added as a collaborator (when a GitHub username was provided at intake).</li>
+      <li><b>Customer account</b> — your Shopify customer account (via the Partner API) is tagged as a build partner.</li>
+      <li><b>Daily standups</b> — a task is created for you every working day; complete it on your Notion board or from your dashboard.</li>
+    </ul>
+    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
+      <a href="${trackUrl}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Open your progress dashboard →</a>
     </td></tr></table>
     <p style="margin:0 0 10px;color:#131320;"><b>📈 Your builder profile</b> — connected to your Shopify customer account at <a href="${ACCOUNT_URL}" style="color:#8a6d1f;">account.brainsait.org</a>. Track your progress, showcase your proof, ship your product.</p>
     <hr style="border:none;border-top:1px solid #e5ddc4;margin:20px 0;" />
-    <p style="margin:0;color:#666;font-size:13px;font-family:Arial,sans-serif;">Application <b>${appRef}</b> · Track progress at <a href="${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}" style="color:#8a6d1f;">${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}</a></p>
+    <p style="margin:0;color:#666;font-size:13px;font-family:Arial,sans-serif;">Application <b>${appRef}</b> · Track progress at <a href="${trackUrl}" style="color:#8a6d1f;">${trackUrl}</a></p>
   `;
   const html = luxuryEmailShell('Your BrainSAIT partner seat is active 🎉', body);
   await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      from: env.RESEND_FROM_EMAIL || 'BrainSAIT <orders@brainsait.org>',
+      from: env.RESEND_FROM_EMAIL || RESEND_FROM,
       to: email,
       subject: '🎉 Your BrainSAIT partner seat is active — Second Brain inside',
       html,
@@ -1090,7 +1911,111 @@ async function sendPaidWelcomeEmail(env: Env, email: string, name: string, appRe
   });
 }
 
+async function sendTelegramWelcome(env: Env, opts: {
+  telegramId?: string;
+  fullName: string;
+  appRef: string;
+  githubUsername?: string;
+}): Promise<void> {
+  if (!env.TELEGRAM_BOT_TOKEN || !opts.telegramId) return;
+  const trackUrl = `${BUILD_TRACK_URL}?ref=${encodeURIComponent(opts.appRef)}`;
+  const repoName = `build-${opts.appRef.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 60)}`;
+  const lines = [
+    `🎉 <b>Welcome, ${escapeHtml(opts.fullName)}</b> — your BUILD seat is ACTIVE!`,
+    `✅ Payment confirmed · Super Partner`,
+    `🚀 Founder OS course: ${FOUNDER_OS_URL}`,
+    `🧠 Your 2nd Brain (BUILD): ${ULTIMATE_BRAIN_BUILD_URL}`,
+    opts.githubUsername ? `🐙 Your GitHub repo: ${GITHUB_PROFILE_URL}/${GITHUB_TEMPLATE_OWNER}/${repoName}` : '',
+    `📊 Track your 16 milestones: ${trackUrl}`,
+    env.TELEGRAM_COHORT_LINK ? `👥 Cohort: ${env.TELEGRAM_COHORT_LINK}` : '',
+    `📅 Adjust plan or discount: ${CALENDAR_URL}`,
+  ].filter(Boolean).join('\n');
+  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: opts.telegramId,
+      text: lines,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    }),
+  });
+}
+
+async function sweepUnprocessedPaidOrders(env: Env): Promise<void> {
+  // Reliability fallback for the orders/paid webhook: scan recent paid orders
+  // via the Admin API and provision any BUILD application the webhook hasn't
+  // already handled (idempotent via the webhook-processed dedup key). This
+  // guarantees enrollment even if a webhook delivery is lost — the cron runs
+  // daily (plus on demand via POST /admin/sweep).
+  if (!env.SHOPIFY_ADMIN_TOKEN) return;
+  try {
+    const shop = env.SHOPIFY_STORE_DOMAIN || 'f3rbxp-n1.myshopify.com';
+    const resp = await fetch(
+      `https://${shop}/admin/api/2026-04/orders.json?status=any&financial_status=paid&limit=50` +
+      `&fields=id,admin_graphql_api_id,email,contact_email,line_items,note_attributes,properties,created_at`,
+      { headers: { 'X-Shopify-Access-Token': env.SHOPIFY_ADMIN_TOKEN } },
+    );
+    if (!resp.ok) { console.error(`sweep: orders fetch HTTP ${resp.status}`); return; }
+    const data = (await resp.json()) as { orders?: any[] };
+    for (const order of data.orders || []) {
+      const gid = String(order.admin_graphql_api_id || order.id || '');
+      if (!gid || await env.APPLICATIONS.get(`webhook-processed:${gid}`)) continue;
+      const attrs = order.note_attributes || [];
+      const itemProps = (order.line_items || []).flatMap((li: any) => li.properties || []);
+      const findRef = (list: any[]) => {
+        const a = list.find((x: any) => x.name === 'application_ref' || x.name === 'applicationRef');
+        return a?.value ?? null;
+      };
+      const appRef = findRef(attrs) || findRef(itemProps) || findRef(order.properties || []);
+      if (!appRef) continue;
+      // Installment partial payments must NOT trigger full approval — mirror
+      // the webhook's installment handling so a */15 sweep can't approve a
+      // partner after a single partial payment.
+      try {
+        const instRes = await handleInstallmentPayment(env, order, itemProps, order.properties || [], appRef);
+        if (instRes) {
+          console.log(`sweep: order ${gid} appRef=${appRef} installment handled (HTTP ${instRes.status})`);
+          await env.APPLICATIONS.put(`webhook-processed:${gid}`, '1', { expirationTtl: 60 * 60 * 24 * 90 });
+          continue;
+        }
+      } catch (err) {
+        console.error(`sweep: installment check failed for ${gid}: ${err}`);
+      }
+      try {
+        const res = await provisionPaidApplication(env, order, appRef, null);
+        console.log(`sweep: order ${gid} appRef=${appRef} → HTTP ${res.status}`);
+        if (res.status === 200) {
+          await env.APPLICATIONS.put(`webhook-processed:${gid}`, '1', { expirationTtl: 60 * 60 * 24 * 90 });
+        }
+      } catch (err) {
+        console.error(`sweep: order ${gid} failed: ${err}`);
+      }
+    }
+  } catch (err) {
+    console.error(`sweepUnprocessedPaidOrders failed: ${err}`);
+  }
+}
+
 async function handleCron(_event: ScheduledEvent, env: Env): Promise<void> {
+  // Reliability sweep: provisions any paid BUILD order the webhook missed.
+  try {
+    await sweepUnprocessedPaidOrders(env);
+  } catch { /* best-effort */ }
+
+  // INSTALLMENT SWEEP runs daily regardless of Notion config — it tracks
+  // payment schedules, escalates reminders, and suspends overdue partners.
+  try {
+    const sweep = await runInstallmentSweep(env);
+    if (sweep.reminded || sweep.suspended) {
+      await emitHubEvent(env, {
+        type: 'installment.sweep',
+        source: 'build-apply',
+        data: sweep,
+      });
+    }
+  } catch { /* best-effort */ }
+
   if (!env.NOTION_BUILD_DB_ID || !env.NOTION_TASKS_DB_ID) return;
 
   const now = new Date();
@@ -1129,20 +2054,15 @@ async function handleCron(_event: ScheduledEvent, env: Env): Promise<void> {
     } catch { /* best-effort */ }
 
     if (env.RESEND_API_KEY && email) {
-      await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          from: env.RESEND_FROM_EMAIL || 'BrainSAIT <orders@brainsait.org>',
-          to: email,
-          subject: 'Your BrainSAIT Build daily standup',
-          html: `<div style="font-family:system-ui,sans-serif;max-width:600px;margin:0 auto;">
-            <h2>Good morning ${escapeHtml(name)} 👋</h2>
-            <p>Time for your daily standup. Reply to the Telegram bot with <code>/standup</code> or update your task board in Notion.</p>
-            <p><a href="https://t.me/BrainSAITForgeBot">Open Forge Bot</a></p>
-          </div>`,
-        }),
-      });
+      const appRef = props['Payment Reference']?.rich_text?.[0]?.plain_text;
+      // Determine the partner's current curriculum day from completed milestones,
+      // then send that day's "newsletter" (theory + lab + deliverable + tools).
+      let curriculumDay = 0;
+      try {
+        const p = await calculateProgress(env, id);
+        curriculumDay = Math.max(0, Math.min(15, p.milestones.filter((m) => m.status === 'Completed').length));
+      } catch { /* default day 0 */ }
+      await sendDailyCurriculumEmail(env, email, name, curriculumDay, appRef || '');
     }
   }
 }
@@ -1251,6 +2171,7 @@ function certificateHtml(name: string, appRef: string, certCode: string, issuedA
   const safeRef = escapeHtml(appRef);
   const safeCode = escapeHtml(certCode);
   const date = new Date(issuedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
+  const pdfUrl = `${BUILD_CERT_BASE}/certificate/${encodeURIComponent(appRef)}/pdf`;
   return `<!DOCTYPE html>
 <html lang="en" dir="ltr">
 <head>
@@ -1296,6 +2217,7 @@ function certificateHtml(name: string, appRef: string, certCode: string, issuedA
     </div>
     <div class="stamp">The<br/>Second<br/>Brain<br/>Verified</div>
     <div class="foot"><b>BrainSAIT</b>Founder &amp; Incubation<br/>brainsait.org</div>
+    <div style="position:absolute;bottom:26px;left:50%;transform:translateX(-50%);"><a href="${pdfUrl}" style="display:inline-block;background:#131320;color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:12px;border-radius:999px;padding:9px 22px;">⬇ Download PDF</a></div>
   </div>
 </body>
 </html>`;
@@ -1314,7 +2236,7 @@ p{color:#aaa;line-height:1.7}a{color:#e9c46a}</style></head>
 <body><div class="card"><h1>🎓 ${safeName}, your certificate is being earned</h1>
 <div class="bar"><div class="fill"></div></div>
 <p>Complete all ${total} milestones — ${done} done so far. The moment every milestone is <b>Completed</b>, your premium certificate is issued and emailed to you automatically.</p>
-<p><a href="${FORGE_BOT_URL}">@BrainSAITForgeBot</a> is watching your progress. Keep shipping.</p></div></body></html>`;
+<p>Track your progress and milestones on your dashboard and Notion board. Keep shipping.</p></div></body></html>`;
 }
 
 async function milestonesForCandidate(env: Env, candidateId: string): Promise<{ name: string; status: string }[]> {
@@ -1429,9 +2351,9 @@ async function sendCertificateEmail(
     <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
       <a href="${SECOND_BRAIN_URL}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Open your Second Brain 🧠</a>
     </td></tr></table>
-    <p style="margin:0 0 10px;color:#131320;"><b>🤖 Your companion agent</b> — @BrainSAITForgeBot follows you from registration to certificate. It already knows your progress.</p>
+    <p style="margin:0 0 10px;color:#131320;"><b>🧑‍💻 Keep shipping</b> — your GitHub repo and Notion board stay with you for good; milestones and progress remain tracked in your dashboard.</p>
     <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
-      <a href="${FORGE_BOT_URL}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Chat with your bot on Telegram →</a>
+      <a href="${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Open your dashboard →</a>
     </td></tr></table>
     <p style="margin:18px 0 0;color:#666;font-size:13px;font-family:Arial,sans-serif;">You are now a BrainSAIT <b>partner</b>. Your builder profile lives at <a href="${ACCOUNT_URL}" style="color:#8a6d1f;">account.brainsait.org</a> — track progress, share your story, sell what you built.</p>
   `;
@@ -1440,9 +2362,42 @@ async function sendCertificateEmail(
     method: 'POST',
     headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      from: env.RESEND_FROM_EMAIL || 'BrainSAIT <orders@brainsait.org>',
+      from: env.RESEND_FROM_EMAIL || RESEND_FROM,
       to: email,
       subject: `🎓 Your BrainSAIT Completion Certificate — ${certCode}`,
+      html,
+    }),
+  });
+}
+
+/** The BUILD partner "newsletter" — one curriculum email per program day. */
+async function sendDailyCurriculumEmail(env: Env, email: string, name: string, day: number, appRef: string): Promise<void> {
+  if (!env.RESEND_API_KEY || !email) return;
+  const c = curriculumForDay(day) || BUILD_CURRICULUM[0];
+  const stack = c.stack.map((s) => `<span style="background:#f3edda;border-radius:999px;padding:3px 10px;font-family:Arial,sans-serif;font-size:11px;color:#8a6d1f;margin:0 4px 4px 0;display:inline-block;">${escapeHtml(s)}</span>`).join('');
+  const body = `
+    <p style="margin:0 0 8px;color:#8a6d1f;font-family:Arial,sans-serif;font-size:12px;letter-spacing:.08em;text-transform:uppercase;">Day ${c.day} / 14</p>
+    <p style="margin:0 0 16px;font-size:20px;color:#131320;"><b>${c.emoji} ${escapeHtml(c.title)}</b></p>
+    <p style="margin:0 0 18px;color:#555;font-size:15px;line-height:1.75;">${escapeHtml(c.theory)}</p>
+    <p style="margin:0 0 6px;color:#131320;font-weight:700;">🧪 مختبر اليوم</p>
+    <p style="margin:0 0 18px;color:#555;font-size:15px;line-height:1.75;">${escapeHtml(c.lab)}</p>
+    <p style="margin:0 0 6px;color:#131320;font-weight:700;">✅ التسليم المطلوب</p>
+    <p style="margin:0 0 18px;color:#555;font-size:15px;line-height:1.75;">${escapeHtml(c.deliverable)}</p>
+    <p style="margin:0 0 8px;color:#131320;font-weight:700;">🛠️ أدوات اليوم (سرّ المنظومة)</p>
+    <p style="margin:0 0 20px;">${stack}</p>
+    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:13px 30px;">
+      <a href="${SECOND_BRAIN_URL}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">افتح دماغك الثاني 🧠</a>
+    </td></tr></table>
+    <p style="margin:0 0 8px;text-align:center;color:#666;font-size:13px;font-family:Arial,sans-serif;">لوحة التقدم: <a href="${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}" style="color:#8a6d1f;">تتبّع معالمك</a></p>
+  `;
+  const html = luxuryEmailShell(`يوم ${c.day} · ${c.title}`, body);
+  await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: env.RESEND_FROM_EMAIL || RESEND_FROM,
+      to: email,
+      subject: `🧠 يوم ${c.day} · ${c.title}`,
       html,
     }),
   });
@@ -1476,6 +2431,13 @@ async function handleProgress(request: Request, env: Env, applicationRef: string
   if (candidate.kv) {
     const app = candidate.kv;
     const progress = kvProgress(app);
+    let repoUrl: string | undefined;
+    try {
+      const rec = (await env.APPLICATIONS.get(`github-provisioned:${applicationRef}`, 'json')) as { repoUrl?: string } | null;
+      repoUrl = rec?.repoUrl;
+    } catch { /* ignore */ }
+    const planStatus = await planStatusForRef(env, applicationRef);
+    const capabilities = computeAccessCapabilities(app.paymentStatus, planStatus);
     return jsonResponse({
       ok: true,
       applicationId: applicationRef,
@@ -1487,17 +2449,30 @@ async function handleProgress(request: Request, env: Env, applicationRef: string
       paymentStatus: app.paymentStatus,
       applicationStatus: app.applicationStatus,
       notionUrl: app.notionUrl,
+      repoUrl: planStatus === 'SUSPENDED' ? undefined : repoUrl,
+      capabilities,
       ...progress,
     }, 200, origin);
   }
   const progress = await calculateProgress(env, candidate.id);
   const props = candidate.properties;
 
+  // The candidate's provisioned GitHub repo (generated after payment from the
+  // BUILD starter) is surfaced here so the Track page can link it directly.
+  let repoUrl: string | undefined;
+  try {
+    const rec = (await env.APPLICATIONS.get(`github-provisioned:${applicationRef}`, 'json')) as { repoUrl?: string } | null;
+    repoUrl = rec?.repoUrl;
+  } catch { /* ignore */ }
+
   // Automated certification: when every milestone is Completed, the
   // certificate is issued once (idempotent) and the luxury email goes out.
   try {
     await checkAndIssueCertificate(env, candidate, applicationRef);
   } catch { /* best-effort — progress still returns */ }
+
+  const planStatus = await planStatusForRef(env, applicationRef);
+  const capabilities = computeAccessCapabilities(props['Payment Status']?.select?.name, planStatus);
 
   return jsonResponse({
     ok: true,
@@ -1510,6 +2485,8 @@ async function handleProgress(request: Request, env: Env, applicationRef: string
     paymentStatus: props['Payment Status']?.select?.name,
     applicationStatus: props['Application Status']?.select?.name,
     notionUrl: candidate.url,
+    repoUrl: planStatus === 'SUSPENDED' ? undefined : repoUrl,
+    capabilities,
     ...progress,
   }, 200, origin);
 }
@@ -1561,6 +2538,91 @@ async function handleCertificate(request: Request, env: Env, applicationRef: str
     status: 200,
     headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders(origin), 'Cache-Control': 'public, max-age=300' },
   });
+}
+
+async function certificateInfoForRef(env: Env, applicationRef: string) {
+  const candidate = await findApplicationByRef(env, applicationRef);
+  if (!candidate) return null;
+  const name = candidate.kv
+    ? candidate.kv.fullName
+    : candidate.properties.Name?.title?.[0]?.plain_text || 'Builder';
+  const trackName = candidate.kv
+    ? candidate.kv.trackName
+    : candidate.properties['Founder OS Track']?.select?.name || 'Founder Accelerator';
+  let record: any = null;
+  try { record = await env.APPLICATIONS.get(CERT_KEY(applicationRef), 'json'); } catch { /* ignore */ }
+  if (!record?.issued) {
+    // Issue if fully complete, otherwise return "not ready".
+    await checkAndIssueCertificate(env, candidate, applicationRef);
+    try { record = await env.APPLICATIONS.get(CERT_KEY(applicationRef), 'json'); } catch { /* ignore */ }
+  }
+  if (!record?.issued) return { name, trackName, issued: false as const };
+  return {
+    name,
+    trackName,
+    issued: true as const,
+    code: record.code,
+    issuedAt: record.issuedAt || new Date().toISOString(),
+  };
+}
+
+async function handleCertificatePdf(request: Request, env: Env, applicationRef: string): Promise<Response> {
+  const origin = request.headers.get('origin');
+  if (!applicationRef || applicationRef.length < 8) {
+    return jsonResponse({ ok: false, error: 'Invalid application ref' }, 400, origin);
+  }
+  const info = await certificateInfoForRef(env, applicationRef);
+  if (!info) return jsonResponse({ ok: false, error: 'Application not found' }, 404, origin);
+  if (!info.issued) return jsonResponse({ ok: false, error: 'Certificate not issued yet — complete all milestones' }, 409, origin);
+
+  const pdf = await generateCertificatePdf({
+    name: info.name,
+    code: info.code,
+    appRef: applicationRef,
+    track: info.trackName,
+    issuedAt: info.issuedAt,
+  });
+
+  return new Response(pdf as unknown as BodyInit, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `inline; filename="BrainSAIT-Certificate-${info.code}.pdf"`,
+      'Cache-Control': 'public, max-age=300',
+      ...corsHeaders(origin),
+    },
+  });
+}
+
+async function handleCertificateSign(request: Request, env: Env, applicationRef: string): Promise<Response> {
+  const origin = request.headers.get('origin');
+  if (!applicationRef || applicationRef.length < 8) {
+    return jsonResponse({ ok: false, error: 'Invalid application ref' }, 400, origin);
+  }
+  const info = await certificateInfoForRef(env, applicationRef);
+  if (!info) return jsonResponse({ ok: false, error: 'Application not found' }, 404, origin);
+  if (!info.issued) return jsonResponse({ ok: false, error: 'Certificate not issued yet — complete all milestones' }, 409, origin);
+
+  const pdf = await generateCertificatePdf({
+    name: info.name,
+    code: info.code,
+    appRef: applicationRef,
+    track: info.trackName,
+    issuedAt: info.issuedAt,
+  });
+
+  const result = await signCertificateWithAdobe(
+    {
+      integrationKey: env.ADOBE_SIGN_INTEGRATION_KEY,
+      clientSecret: env.ADOBE_SIGN_CLIENT_SECRET,
+      apiBase: env.ADOBE_SIGN_BASE,
+      signerEmail: env.ADOBE_SIGN_SIGNER_EMAIL,
+    },
+    pdf,
+    { name: info.name, code: info.code },
+  );
+
+  return jsonResponse(result, result.ok ? 200 : 502, origin);
 }
 
 async function handleBotLink(request: Request, env: Env): Promise<Response> {
@@ -1749,11 +2811,93 @@ async function handleBotProgress(request: Request, env: Env): Promise<Response> 
   }, 200, origin);
 }
 
+/** Derive the candidate's current curriculum day (0–15) from completed milestones. */
+async function currentDayForCandidate(env: Env, candidate: { id: string; properties: any; kv?: KvApplication }): Promise<number> {
+  if (candidate.kv) return 0; // KV path has no milestones; caller supplies an explicit day.
+  const milestones = await milestonesForCandidate(env, candidate.id);
+  const done = milestones.filter((m) => m.status === 'Completed').length;
+  return Math.max(0, Math.min(15, done));
+}
+
+async function handleBotGuide(request: Request, env: Env): Promise<Response> {
+  const origin = request.headers.get('origin');
+  const body = (await request.json().catch(() => ({}))) as { telegram_id?: string; day?: number };
+  if (!body.telegram_id) return jsonResponse({ ok: false, error: 'Missing telegram_id' }, 400, origin);
+  const candidate = await findApplicationByTelegram(env, body.telegram_id);
+  if (!candidate) return jsonResponse({ ok: false, error: 'No application linked. Use /link <ref> first.' }, 404, origin);
+
+  const day = Math.max(0, Math.min(15, typeof body.day === 'number' ? body.day : await currentDayForCandidate(env, candidate)));
+  const c = curriculumForDay(day) || BUILD_CURRICULUM[0];
+  const message = [
+    `${c.emoji} اليوم ${c.day} — ${c.title}`,
+    `${c.theme}`,
+    ``,
+    `📖 النظرية:`,
+    c.theory,
+    ``,
+    `🧪 المختبر العملي:`,
+    c.lab,
+    ``,
+    `✅ المطلوب اليوم:`,
+    c.deliverable,
+    ``,
+    `🛠️ الأدوات (سرّ المنظومة):`,
+    c.stack.join(' · '),
+    ``,
+    `أرسل /test لاختبار فهمك، و/day لتسجيل إنجاز اليوم.`,
+  ].join('\n');
+
+  return jsonResponse({ ok: true, day, title: c.title, stack: c.stack, message }, 200, origin);
+}
+
+async function handleBotTest(request: Request, env: Env): Promise<Response> {
+  const origin = request.headers.get('origin');
+  const body = (await request.json().catch(() => ({}))) as { telegram_id?: string; day?: number };
+  if (!body.telegram_id) return jsonResponse({ ok: false, error: 'Missing telegram_id' }, 400, origin);
+  const candidate = await findApplicationByTelegram(env, body.telegram_id);
+  if (!candidate) return jsonResponse({ ok: false, error: 'No application linked. Use /link <ref> first.' }, 404, origin);
+
+  const day = Math.max(0, Math.min(15, typeof body.day === 'number' ? body.day : await currentDayForCandidate(env, candidate)));
+  const c = curriculumForDay(day) || BUILD_CURRICULUM[0];
+  const message = [
+    `${c.emoji} اختبار اليوم ${c.day}:`,
+    c.quiz.q,
+    ``,
+    ...c.quiz.options.map((o, i) => `${i + 1}) ${o}`),
+    ``,
+    `أجب عبر /answer ${c.day} <رقم الخيار>`,
+  ].join('\n');
+
+  return jsonResponse({ ok: true, day, quiz: c.quiz, message }, 200, origin);
+}
+
+async function handleBotAnswer(request: Request, env: Env): Promise<Response> {
+  const origin = request.headers.get('origin');
+  const body = (await request.json().catch(() => ({}))) as { telegram_id?: string; day?: number; option?: number };
+  if (!body.telegram_id) return jsonResponse({ ok: false, error: 'Missing telegram_id' }, 400, origin);
+  const candidate = await findApplicationByTelegram(env, body.telegram_id);
+  if (!candidate) return jsonResponse({ ok: false, error: 'No application linked.' }, 404, origin);
+
+  const day = Math.max(0, Math.min(15, typeof body.day === 'number' ? body.day : await currentDayForCandidate(env, candidate)));
+  const c = curriculumForDay(day) || BUILD_CURRICULUM[0];
+  const chosen = typeof body.option === 'number' ? body.option - 1 : -1;
+  const correct = chosen === c.quiz.answer;
+  const message = [
+    correct ? `✅ إجابة صحيحة! أحسنت — أنت تبني فعلاً.` : `❌ ليست الإجابة الصحيحة. الخيار الصحيح: ${c.quiz.answer + 1}) ${c.quiz.options[c.quiz.answer]}`,
+    ``,
+    `💡 ${c.quiz.explain}`,
+    ``,
+    `واصل — أرسل /day لتسجيل إنجاز اليوم التالي، أو /guide لليوم القادم.`,
+  ].join('\n');
+
+  return jsonResponse({ ok: true, correct, message }, 200, origin);
+}
+
 async function handleAdminStats(request: Request, env: Env): Promise<Response> {
   const origin = request.headers.get('origin');
-  const auth = request.headers.get('authorization') || '';
-  if (env.ADMIN_TOKEN && auth !== `Bearer ${env.ADMIN_TOKEN}`) {
-    return jsonResponse({ ok: false, error: 'Unauthorized' }, 401, origin);
+  const token = request.headers.get('x-admin-token') || '';
+  if (!env.ADMIN_TOKEN || token !== env.ADMIN_TOKEN) {
+    return jsonResponse({ ok: false, error: 'unauthorized' }, 401, origin);
   }
 
   const statusCounts: Record<string, number> = {};
@@ -1791,7 +2935,7 @@ async function handleAdminStats(request: Request, env: Env): Promise<Response> {
   }
   const kvApps = await kvList(env);
   for (const app of kvApps) {
-    count(app.applicationStatus, app.trackName, kvProgress(app).badges, kvProgress(app).percent * 100);
+    count(app.applicationStatus || 'Unknown', app.trackName || 'None', kvProgress(app).badges, kvProgress(app).percent * 100);
   }
   const total = notionTotal + kvApps.length;
 
@@ -1808,6 +2952,29 @@ async function handleAdminStats(request: Request, env: Env): Promise<Response> {
 
 const SHOPIFY_SHOP_DOMAIN = 'brainsait.myshopify.com';
 const SHOPIFY_API_VERSION = '2025-10';
+
+/** Best-effort Shopify REST helper (used for legacy REST endpoints). */
+async function shopifyRest(env: Env, method: string, path: string, body?: unknown): Promise<{ ok: boolean; data?: any; error?: string }> {
+  try {
+    const res = await fetch(
+      `https://${env.SHOPIFY_STORE_DOMAIN || SHOPIFY_SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/${path.replace(/^\//, '')}`,
+      {
+        method,
+        headers: {
+          'X-Shopify-Access-Token': env.SHOPIFY_ADMIN_TOKEN || '',
+          'Content-Type': 'application/json',
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      },
+    );
+    const text = await res.text();
+    const data = text ? JSON.parse(text) : null;
+    if (!res.ok) return { ok: false, error: `${path}: HTTP ${res.status} ${text.slice(0, 200)}` };
+    return { ok: true, data };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
 
 async function shopifyGraphQL(env: Env, query: string, variables: Record<string, unknown>): Promise<any> {
   const res = await fetch(
@@ -1892,7 +3059,7 @@ async function syncShopifyCustomer(env: Env, input: CustomerSyncInput, sendEmail
       return { ok: true, customerId: res?.data?.customerUpdate?.customer?.id, action: 'updated' };
     }
 
-    const res = await shopifyGraphQL(env, `mutation($input: CustomerInput!, $invite: Boolean!) { customerCreate(input: $input, sendEmailInvite: $invite) { customer { id } userErrors { field message } } }`, {
+    const res = await shopifyGraphQL(env, `mutation($input: CustomerInput!) { customerCreate(input: $input) { customer { id } userErrors { field message } } }`, {
       input: {
         email: input.email,
         firstName,
@@ -1901,14 +3068,443 @@ async function syncShopifyCustomer(env: Env, input: CustomerSyncInput, sendEmail
         tags: Array.from(tags).join(', '),
         ...consent,
       },
-      invite: sendEmailInvite,
     });
     const errs = res?.errors || res?.data?.customerCreate?.userErrors || [];
     if (errs.length > 0) return { ok: false, error: errs.map((e: any) => e.message).join('; ') };
-    return { ok: true, customerId: res?.data?.customerCreate?.customer?.id, action: 'created' };
+    const customerId = res?.data?.customerCreate?.customer?.id;
+    if (sendEmailInvite && customerId) {
+      // `sendEmailInvite` was removed from customerCreate in current API
+      // versions; the account invite is now its own dedicated mutation.
+      const inviteRes = await shopifyGraphQL(env, `mutation($id: ID!) { customerSendAccountInviteEmail(customerId: $id) { customer { id } userErrors { field message } } }`, { id: customerId });
+      const inviteErrs = inviteRes?.errors || inviteRes?.data?.customerSendAccountInviteEmail?.userErrors || [];
+      if (inviteErrs.length > 0) return { ok: false, error: inviteErrs.map((e: any) => e.message).join('; ') };
+    }
+    return { ok: true, customerId, action: 'created' };
   } catch (e) {
     return { ok: false, error: String(e) };
   }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * SUPER PARTNER SUITE — BrainSAIT OS expanded Admin API capabilities.
+ *
+ * These best-effort helpers turn a paid BUILD candidate into a fully
+ * provisioned partner: fulfillment record on their order, a welcome gift
+ * card, a Shopify Company (B2B), a partner-provisioned note on the order,
+ * and idempotent ordering. Every function returns quietly on failure so the
+ * rest of the pipeline is never blocked.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/** Issue a welcome gift card to a paid partner (best-effort, idempotent via KV). */
+async function issueWelcomeGiftCard(env: Env, input: { email: string; appRef: string; name?: string }): Promise<{ ok: boolean; giftCardId?: string; idempotent?: boolean; error?: string }> {
+  if (!env.SHOPIFY_ADMIN_TOKEN) return { ok: false, error: 'no admin token' };
+  const dedupKey = `giftcard:${input.appRef}`;
+  try {
+    if (await env.APPLICATIONS.get(dedupKey)) return { ok: true, idempotent: true };
+  } catch { /* best-effort */ }
+
+  // The BUILD partner bonus: SAR 500 store credit as a welcome gift.
+  const amount = '500.00';
+  try {
+    const res = await shopifyGraphQL(env, `mutation($input: GiftCardCreateInput!) {
+      giftCardCreate(input: $input) { giftCard { id } userErrors { field message } }
+    }`, {
+      input: {
+        initialValue: amount,
+        customerId: null,
+        note: `BUILD partner welcome gift — ${input.appRef}`,
+        expiresOn: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+      },
+    });
+    const errs = res?.errors || res?.data?.giftCardCreate?.userErrors || [];
+    if (errs.length > 0) return { ok: false, error: errs.map((e: any) => e.message).join('; ') };
+    const id = res?.data?.giftCardCreate?.giftCard?.id;
+    if (id) {
+      try { await env.APPLICATIONS.put(dedupKey, id, { expirationTtl: 400 * 24 * 60 * 60 }); } catch { /* best-effort */ }
+      return { ok: true, giftCardId: id };
+    }
+    return { ok: false, error: 'no gift card id returned' };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/** Create a B2B Shopify Company for a paid partner (best-effort). */
+async function createPartnerCompany(env: Env, input: { email: string; fullName?: string; appRef: string }): Promise<{ ok: boolean; companyId?: string; error?: string }> {
+  if (!env.SHOPIFY_ADMIN_TOKEN) return { ok: false, error: 'no admin token' };
+  try {
+    const name = input.fullName?.trim() ? `${input.fullName.trim()} — BrainSAIT Partner` : 'BrainSAIT Partner';
+    const res = await shopifyGraphQL(env, `mutation($input: CompanyCreateInput!) {
+      companyCreate(input: $input) { company { id } userErrors { field message } }
+    }`, {
+      input: {
+        company: {
+          name,
+          externalId: input.appRef,
+          note: `BUILD partner (${input.appRef}) — customer account ${input.email}`,
+        },
+        companyContact: {
+          email: input.email,
+        },
+      },
+    });
+    const errs = res?.errors || res?.data?.companyCreate?.userErrors || [];
+    if (errs.length > 0) return { ok: false, error: errs.map((e: any) => e.message).join('; ') };
+    const id = res?.data?.companyCreate?.company?.id;
+    return id ? { ok: true, companyId: id } : { ok: false, error: 'no company id' };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * Create a fulfillment record on the paid BUILD order so the partner's order
+ * shows as fulfilled (the "BUILD onboarding kit" is the deliverable). Uses the
+ * store's first location. Idempotent per order.
+ */
+async function createBuildFulfillment(env: Env, input: { orderId: string; appRef: string; email?: string }): Promise<{ ok: boolean; fulfillmentId?: string; idempotent?: boolean; error?: string }> {
+  if (!env.SHOPIFY_ADMIN_TOKEN) return { ok: false, error: 'no admin token' };
+  const dedupKey = `fulfillment:${input.appRef}`;
+  try {
+    if (await env.APPLICATIONS.get(dedupKey)) return { ok: true, idempotent: true };
+  } catch { /* best-effort */ }
+
+  try {
+    const locRes = await shopifyGraphQL(env, `{ locations(first: 1) { edges { node { id } } } }`, {});
+    const locationId = locRes?.data?.locations?.edges?.[0]?.node?.id;
+    if (!locationId) return { ok: false, error: 'no location' };
+
+    // Get the line items on this order so we can fulfill them.
+    const o = await shopifyGraphQL(env, `query($id: ID!) { order(id: $id) { id lineItems(first: 50) { edges { node { id quantity } } } } }`, { id: input.orderId });
+    const items = o?.data?.order?.lineItems?.edges?.map((e: any) => ({ id: e.node.id, quantity: e.node.quantity })) || [];
+
+    const res = await shopifyGraphQL(env, `mutation($orderId: ID!, $lineItems: [FulfillmentOrderLineItemInput!]!, $locationId: ID!, $notify: Boolean!) {
+      fulfillmentCreateV2(fulfillment: { lineItemsByFulfillmentOrder: [{ fulfillmentOrderId: $orderId, fulfillmentOrderLineItems: $lineItems }], trackingInfo: { company: "BrainSAIT", number: "BUILD-${input.appRef.slice(0, 8).toUpperCase()}" }, notifyCustomer: $notify, locationId: $locationId }) {
+        fulfillment { id }
+        userErrors { field message }
+      }
+    }`, {
+      orderId: input.orderId,
+      lineItems: items,
+      locationId,
+      notify: false,
+    });
+    const errs = res?.errors || res?.data?.fulfillmentCreateV2?.userErrors || [];
+    if (errs.length > 0) return { ok: false, error: errs.map((e: any) => e.message).join('; ') };
+    const id = res?.data?.fulfillmentCreateV2?.fulfillment?.id;
+    if (id) {
+      try { await env.APPLICATIONS.put(dedupKey, id, { expirationTtl: 400 * 24 * 60 * 60 }); } catch { /* best-effort */ }
+      return { ok: true, fulfillmentId: id };
+    }
+    return { ok: false, error: 'no fulfillment id' };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * Tag the paid order as a BUILD partner order and append a provisioning note
+ * so the store timeline records the Super-partner activation. Best-effort.
+ */
+async function annotateBuildOrder(env: Env, input: { orderId: string; appRef: string; companyId?: string; giftCardId?: string }): Promise<{ ok: boolean; error?: string }> {
+  if (!env.SHOPIFY_ADMIN_TOKEN) return { ok: false, error: 'no admin token' };
+  try {
+    const parts = ['Super-partner provisioning complete', `application_ref: ${input.appRef}`];
+    if (input.companyId) parts.push(`company: ${input.companyId}`);
+    if (input.giftCardId) parts.push(`gift_card: ${input.giftCardId}`);
+    const res = await shopifyGraphQL(env, `mutation($id: ID!, $tags: [String!]!, $note: String!) {
+      orderUpdate(input: { id: $id, tags: $tags, note: $note }) { order { id } userErrors { field message } }
+    }`, {
+      id: input.orderId,
+      tags: ['build-partner', 'super-provisioned'],
+      note: parts.join(' · '),
+    });
+    const errs = res?.errors || res?.data?.orderUpdate?.userErrors || [];
+    if (errs.length > 0) return { ok: false, error: errs.map((e: any) => e.message).join('; ') };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * Orchestrate the full "Super" partner provisioning for a paid BUILD order.
+ * Everything is independently best-effort — no single failure blocks the rest.
+ */
+async function provisionSuperPartner(env: Env, input: { orderId: string; email: string; fullName?: string; appRef: string; phone?: string }): Promise<{ ok: boolean; results: Record<string, any> }> {
+  const results: Record<string, any> = {};
+
+  // 1. Fulfillment record on the paid order.
+  results.fulfillment = await createBuildFulfillment(env, { orderId: input.orderId, appRef: input.appRef, email: input.email });
+
+  // 2. Welcome gift card (SAR 500 store credit).
+  results.giftCard = await issueWelcomeGiftCard(env, { email: input.email, appRef: input.appRef, name: input.fullName });
+
+  // 3. B2B company record for the partner.
+  results.company = await createPartnerCompany(env, { email: input.email, fullName: input.fullName, appRef: input.appRef });
+
+  // 4. Tag the order + note the provisioning so the store timeline records it.
+  results.annotation = await annotateBuildOrder(env, {
+    orderId: input.orderId,
+    appRef: input.appRef,
+    companyId: results.company?.companyId,
+    giftCardId: results.giftCard?.giftCardId,
+  });
+
+  const ok = Object.values(results).every((r) => r?.ok === true || r?.idempotent === true);
+  return { ok, results };
+}
+
+/**
+ * Push the partner provisioning into the account portal so the partner's
+ * profile at portal.brainsait.de is promoted to the partner role with all
+ * Super entitlements (fulfillment, gift card, company, GitHub, Notion).
+ * Best-effort — the event bus remains the primary fan-out; this is the
+ * synchronous profile write.
+ */
+async function syncPartnerProfile(env: Env, input: Record<string, string>): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const portal = 'https://portal.brainsait.de/api/integration/super-partner';
+    const res = await fetch(portal, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+      signal: AbortSignal.timeout(8000),
+    });
+    const data = (await res.json()) as { ok?: boolean; error?: string };
+    if (!res.ok || data.ok !== true) return { ok: false, error: data.error || `HTTP ${res.status}` };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * Index a newly provisioned partner into the AI-searchable knowledge base
+ * (D1 via the MCP hub's kb_embed) and mirror the record into the same D1
+ * store as a structured partner row for the AI gateway / RAG to query.
+ * Best-effort — never blocks the paid confirmation.
+ */
+async function embedPartnerToKb(env: Env, input: Record<string, string>): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const hubBase = 'https://hub.brainsait.org';
+    const payload = {
+      document_id: `partner:${input.applicationId}`,
+      text: [
+        `BrainSAIT SUPER partner provisioned`,
+        `Name: ${input.fullName}`,
+        `Email: ${input.email}`,
+        `Tier: ${input.tier || 'STANDARD'}`,
+        `Application: ${input.applicationId}`,
+        `Order: ${input.orderId}`,
+        `Fulfillment: ${input.fulfillmentId}`,
+        `Gift card: ${input.giftCardId}`,
+        `Company: ${input.companyId}`,
+        `GitHub: ${input.githubUsername}`,
+        `Track: ${input.trackUrl}`,
+        `Notion: ${input.notionUrl}`,
+      ].join('\n'),
+      metadata: {
+        source: 'build-apply',
+        category: 'partner',
+        relevance_score: 0.9,
+        language: 'en',
+        tags: ['super', 'partner', 'build', input.applicationId],
+      },
+    };
+    const res = await fetch(`${hubBase}/mcp/v1/kb/embed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Hub-Key': env.MCP_HUB_KEY || env.HUB_KEY || '' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return { ok: false, error: `kb embed HTTP ${res.status}` };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * Update the candidate's Notion page (inside the Second Brain) with their
+ * Super-partner entitlements: add a "Super Partner" badge, record the
+ * fulfillment / gift card / company ids in the Notes, and bump Last Activity.
+ * Best-effort — the Notion page may not exist for KV-only applications.
+ */
+async function syncPartnerToNotion(env: Env, input: { candidateId?: string; appRef: string; fullName?: string; fulfillmentId?: string; giftCardId?: string; companyId?: string; trackUrl?: string; notionUrl?: string }): Promise<{ ok: boolean; error?: string }> {
+  if (!env.NOTION_TOKEN || !input.candidateId) return { ok: false, error: 'notion not configured' };
+  try {
+    const lines = [
+      `✅ SUPER partner provisioned (${new Date().toISOString()})`,
+      `• Application: ${input.appRef}`,
+      `• Fulfillment: ${input.fulfillmentId || '—'}`,
+      `• Gift card: ${input.giftCardId || '—'}`,
+      `• Company: ${input.companyId || '—'}`,
+      input.trackUrl ? `• Track: ${input.trackUrl}` : '',
+    ].filter(Boolean).join('\n');
+
+    const body = JSON.stringify({
+      properties: {
+        'Badges': { multi_select: [{ name: 'Super Partner' }] },
+        'Last Activity': { date: { start: new Date().toISOString() } },
+        'Notes': { rich_text: [{ text: { content: lines } }] },
+      },
+    });
+    const resp = await fetch(`https://api.notion.com/v1/pages/${input.candidateId}`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${env.NOTION_TOKEN}`,
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+      },
+      body,
+    });
+    if (!resp.ok) return { ok: false, error: `notion PATCH HTTP ${resp.status}` };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * INSTALLMENT ECOSYSTEM BROADCAST — every installment lifecycle event
+ * fans out so the WHOLE ecosystem stays in sync:
+ *   · Notion   — candidate page Notes + Last Activity
+ *   · Airtable — Build Candidates ledger (plan, paid, status)
+ *   · Hub      — event bus → Telegram / SMS / n8n
+ *   · GitHub   — collaborator access revoked on suspend, restored on resume
+ *   · KB (D1)  — AI-searchable installment snapshot
+ * Best-effort everywhere; never throws.
+ * ───────────────────────────────────────────────────────────────────── */
+
+/** Build a human-readable installment status summary from a plan. */
+function installmentSummary(plan: InstallmentPlan): string {
+  const paid = plan.installments.filter((i) => i.status === 'PAID').length;
+  const paidAmt = plan.installments.filter((i) => i.status === 'PAID').reduce((a, i) => a + i.amount, 0);
+  const next = plan.installments.find((i) => i.status !== 'PAID');
+  return [
+    `Plan: ${plan.plan} (${plan.installments.length} payments)`,
+    `Status: ${plan.status}`,
+    `Paid: ${paid}/${plan.installments.length} · SAR ${paidAmt} / ${plan.total}`,
+    next ? `Next due: ${next.label} SAR ${next.amount} on ${next.dueAt.slice(0, 10)}` : 'All settled',
+  ].join('\n');
+}
+
+/** Find the GitHub username + repo for an application (for suspend/resume). */
+async function partnerGitHubInfo(env: Env, appRef: string): Promise<{ username?: string; repo?: string }> {
+  try {
+    const rec = (await env.APPLICATIONS.get(`github-provisioned:${appRef}`, 'json')) as { repoUrl?: string; githubUsername?: string } | null;
+    const repo = rec?.repoUrl ? rec.repoUrl.replace(/^https:\/\/github\.com\//, '').replace(/\/$/, '') : undefined;
+    return { username: rec?.githubUsername, repo };
+  } catch { return {}; }
+}
+
+/** Revoke / restore a partner's GitHub collaborator access. */
+async function setGitHubAccess(env: Env, appRef: string, enabled: boolean): Promise<void> {
+  const { username, repo } = await partnerGitHubInfo(env, appRef);
+  if (!env.GITHUB_TOKEN || !username || !repo) return;
+  const ghHeaders = {
+    Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'Content-Type': 'application/json',
+    'User-Agent': 'brainsait-build-apply',
+  };
+  try {
+    if (enabled) {
+      await fetch(`https://api.github.com/repos/${repo}/collaborators/${encodeURIComponent(username)}`, {
+        method: 'PUT', headers: ghHeaders, body: JSON.stringify({ permission: 'push' }),
+      });
+    } else {
+      await fetch(`https://api.github.com/repos/${repo}/collaborators/${encodeURIComponent(username)}`, {
+        method: 'DELETE', headers: ghHeaders,
+      });
+    }
+  } catch { /* best-effort */ }
+}
+
+/** Broadcast one installment lifecycle snapshot across the ecosystem. */
+async function broadcastInstallment(env: Env, plan: InstallmentPlan, event: string, reason?: string): Promise<void> {
+  const summary = installmentSummary(plan);
+  const paid = plan.installments.filter((i) => i.status === 'PAID').length;
+  const paidAmt = plan.installments.filter((i) => i.status === 'PAID').reduce((a, i) => a + i.amount, 0);
+
+  // 1. Notion — append the installment snapshot to the candidate page.
+  try {
+    const found = await findApplicationByRef(env, plan.ref);
+    if (found?.id && env.NOTION_TOKEN) {
+      const lines = [
+        `📅 Installment update — ${event} (${new Date().toISOString()})`,
+        ...summary.split('\n').map((l) => `• ${l}`),
+        reason ? `• Reason: ${reason}` : '',
+      ].filter(Boolean).join('\n');
+      await notionRequest(env, 'PATCH', `/pages/${found.id}`, {
+        properties: {
+          'Notes': { rich_text: [{ text: { content: lines } }] },
+          'Last Activity': { date: { start: new Date().toISOString() } },
+          'Badges': { multi_select: [{ name: event === 'suspended' ? 'Suspended' : plan.status === 'COMPLETED' ? 'Paid' : 'Activated' }] },
+        },
+      });
+    }
+  } catch { /* best-effort */ }
+
+  // 2. Airtable — mirror the plan + payment state into the Build Candidates ledger.
+  try {
+    await syncAirtableCandidate(env, {
+      fullName: plan.fullName || 'Founder',
+      email: plan.email,
+      phone: plan.phone,
+      country: '',
+      githubUsername: (await partnerGitHubInfo(env, plan.ref)).username,
+      appRef: plan.ref,
+      tier: 'STANDARD',
+      finalPrice: plan.total,
+      paymentStatus: plan.status === 'SUSPENDED' ? 'Suspended' : plan.status === 'COMPLETED' ? 'Paid' : 'Pending',
+      applicationStatus: plan.status === 'COMPLETED' ? 'Approved' : 'New',
+      track: 'Founder Accelerator',
+      notionUrl: (await findApplicationByRef(env, plan.ref))?.url,
+    });
+  } catch { /* best-effort */ }
+
+  // 3. Hub event bus — Telegram / SMS / n8n see every event.
+  try {
+    await emitHubEvent(env, {
+      type: `installment.${event}`,
+      source: 'build-apply',
+      data: {
+        applicationId: plan.ref,
+        email: plan.email,
+        fullName: plan.fullName,
+        plan: plan.plan,
+        status: plan.status,
+        paid,
+        total: plan.installments.length,
+        paidAmount: paidAmt,
+        totalAmount: plan.total,
+        summary,
+        reason,
+        payUrl: installmentPaymentUrl(env, plan.ref, plan, plan.installments.find((i) => i.status !== 'PAID')?.no || 1),
+      },
+    });
+  } catch { /* best-effort */ }
+
+  // 4. GitHub — suspend revokes repo access; resume/paid restores it.
+  if (event === 'suspended') await setGitHubAccess(env, plan.ref, false);
+  if (event === 'resumed' || event === 'paid') await setGitHubAccess(env, plan.ref, true);
+
+  // 5. KB (D1) — keep the AI-searchable snapshot current.
+  try {
+    await embedPartnerToKb(env, {
+      applicationId: plan.ref,
+      email: plan.email,
+      fullName: plan.fullName || 'Founder',
+      tier: 'STANDARD',
+      githubUsername: (await partnerGitHubInfo(env, plan.ref)).username || '',
+      trackUrl: `${BUILD_TRACK_URL}?ref=${encodeURIComponent(plan.ref)}`,
+      notionUrl: (await findApplicationByRef(env, plan.ref))?.url || '',
+      orderId: plan.installments.find((i) => i.status === 'PAID')?.orderId || '',
+    });
+  } catch { /* best-effort */ }
 }
 
 async function handleCustomerSync(request: Request, env: Env): Promise<Response> {
@@ -1944,12 +3540,16 @@ async function handleApply(request: Request, env: Env): Promise<Response> {
   try {
     const payload = (await request.json()) as ApplyPayload;
 
-    if (!payload.fullName || !payload.email || !payload.identity) {
-      return jsonResponse({ ok: false, error: 'Missing required fields: fullName, email, identity' }, 400, origin);
+    if (!payload.fullName || !payload.email) {
+      return jsonResponse({ ok: false, error: 'Missing required fields: fullName, email' }, 400, origin);
     }
     if (!validateEmail(payload.email)) {
       return jsonResponse({ ok: false, error: 'Invalid email address' }, 400, origin);
     }
+    // Tiers were cancelled in 2026-08: every seat is the flat standard
+    // ticket. Identity is no longer collected by the storefront — default
+    // it so legacy data and cohort routing still work.
+    payload.identity = payload.identity || 'OTHER';
 
     if (env.TURNSTILE_SECRET) {
       if (!payload.turnstileToken) {
@@ -2023,6 +3623,7 @@ async function handleApply(request: Request, env: Env): Promise<Response> {
       tier: pricing.eligibilityId,
       trackName: track.name,
       trackUrl: track.url,
+      githubUsername: payload.githubUsername,
       finalPrice: pricing.finalPrice,
       discount: pricing.discount,
       paymentStatus: pricing.finalPrice === 0 ? 'Waived' : 'Pending',
@@ -2048,6 +3649,25 @@ async function handleApply(request: Request, env: Env): Promise<Response> {
       }, false);
     } catch { /* non-fatal */ }
 
+    // Airtable mirror: every applicant gets an always-current record in the
+    // Build Candidates table (updated again when payment lands).
+    try {
+      await syncAirtableCandidate(env, {
+        fullName: payload.fullName,
+        email: payload.email,
+        phone: payload.phone,
+        country: payload.country,
+        githubUsername: payload.githubUsername,
+        appRef,
+        tier: tierLabel(pricing.eligibilityId),
+        finalPrice: pricing.finalPrice,
+        paymentStatus: kvApp.paymentStatus,
+        applicationStatus: kvApp.applicationStatus,
+        track: track.name,
+        notionUrl: notionPage?.url || undefined,
+      });
+    } catch { /* non-fatal */ }
+
     await emitHubEvent(env, {
       type: 'build.apply',
       source: 'build-apply',
@@ -2066,6 +3686,15 @@ async function handleApply(request: Request, env: Env): Promise<Response> {
     });
 
     let checkoutUrl: string | undefined;
+    const planName = (payload.plan === 'flex' || payload.plan === 'split' || payload.plan === 'quarter') ? payload.plan : 'full';
+    const installmentPlan = buildInstallmentSchedule(appRef, payload.email, payload.fullName, payload.phone, planName, pricing.finalPrice);
+    await saveInstallmentPlan(env, installmentPlan);
+    // Broadcast the plan creation so the ecosystem knows (Notion, Airtable,
+    // hub/Telegram/SMS/n8n, KB). Skip for full-payment (single 9,630).
+    if (planName !== 'full') {
+      try { await broadcastInstallment(env, installmentPlan, 'created'); } catch { /* best-effort */ }
+    }
+
     if (pricing.finalPrice > 0) {
       const variantId = SHOPIFY_VARIANTS[pricing.eligibilityId] || SHOPIFY_VARIANTS.standard;
       const shop = env.SHOPIFY_STORE_DOMAIN || 'store.brainsait.org';
@@ -2077,12 +3706,16 @@ async function handleApply(request: Request, env: Env): Promise<Response> {
       params.set('properties[final_price]', String(pricing.finalPrice));
       params.set('properties[application_ref]', appRef);
       params.set('properties[applicant_email]', payload.email);
+      params.set('properties[installment_no]', '1');
+      params.set('properties[installment_ref]', `inst-${appRef}-1`);
       if (pricing.promoCode) {
         params.set('properties[promo_code]', pricing.promoCode);
       }
       // Promo codes are applied through Shopify's /discount/CODE flow, which
-      // pre-applies the code to the cart and redirects to the product page.
-      // (The bare `&discount=` param on /cart/add is not reliably honoured.)
+      // pre-applies the code to the session cart and redirects to the store.
+      // The discount lands on the session cart (verified live: LAUNCH10 ->
+      // 8,667 SAR, FOUNDER15 -> 8,185.50 SAR) and the properties above are
+      // preserved when the customer proceeds to checkout.
       if (pricing.promoCode) {
         const code = encodeURIComponent(pricing.promoCode);
         const add = `https://${shop}/cart/add?${params.toString()}`;
@@ -2110,6 +3743,16 @@ async function handleApply(request: Request, env: Env): Promise<Response> {
         originalPrice: pricing.originalPrice,
         finalPrice: pricing.finalPrice,
         checkoutUrl,
+        plan: planName,
+        installments: planName === 'full'
+          ? null
+          : installmentPlan.installments.map((i) => ({
+              no: i.no,
+              label: i.label,
+              amount: i.amount,
+              dueAt: i.dueAt,
+              payUrl: i.no === 1 ? undefined : installmentPaymentUrl(env, appRef, installmentPlan, i.no),
+            })),
         message: pricing.finalPrice === 0
           ? 'Application received — your access is pending verification.'
           : 'Application received — complete payment to confirm your seat.',
@@ -2190,7 +3833,7 @@ async function handleEvidence(request: Request, env: Env): Promise<Response> {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const origin = request.headers.get('origin');
 
@@ -2222,6 +3865,16 @@ export default {
       return handleShopifyWebhook(request, env);
     }
 
+    if (url.pathname.endsWith('/pdf') && url.pathname.startsWith('/certificate/') && request.method === 'GET') {
+      const ref = decodeURIComponent(url.pathname.slice('/certificate/'.length, -'/pdf'.length));
+      return handleCertificatePdf(request, env, ref);
+    }
+
+    if (url.pathname.endsWith('/sign') && url.pathname.startsWith('/certificate/') && request.method === 'POST') {
+      const ref = decodeURIComponent(url.pathname.slice('/certificate/'.length, -'/sign'.length));
+      return handleCertificateSign(request, env, ref);
+    }
+
     if (url.pathname.startsWith('/certificate/') && request.method === 'GET') {
       return handleCertificate(request, env, decodeURIComponent(url.pathname.slice('/certificate/'.length)));
     }
@@ -2242,8 +3895,102 @@ export default {
       return handleBotProgress(request, env);
     }
 
+    if (url.pathname === '/bot/guide' && request.method === 'POST') {
+      return handleBotGuide(request, env);
+    }
+
+    if (url.pathname === '/bot/test' && request.method === 'POST') {
+      return handleBotTest(request, env);
+    }
+
+    if (url.pathname === '/bot/answer' && request.method === 'POST') {
+      return handleBotAnswer(request, env);
+    }
+
     if (url.pathname === '/admin/stats' && request.method === 'GET') {
       return handleAdminStats(request, env);
+    }
+
+    // On-demand reliability sweep: re-provisions any paid BUILD order the
+    // webhook missed. Guarded by the same ADMIN_TOKEN as /admin/stats.
+    if (url.pathname === '/admin/sweep' && request.method === 'POST') {
+      const token = request.headers.get('x-admin-token') || '';
+      if (!env.ADMIN_TOKEN || token !== env.ADMIN_TOKEN) {
+        return jsonResponse({ ok: false, error: 'unauthorized' }, 401, origin);
+      }
+      await sweepUnprocessedPaidOrders(env);
+      return jsonResponse({ ok: true }, 200, origin);
+    }
+
+    if (url.pathname === '/admin/dbg' && request.method === 'GET') {
+      const token = request.headers.get('x-admin-token') || '';
+      if (!env.ADMIN_TOKEN || token !== env.ADMIN_TOKEN) {
+        return jsonResponse({ ok: false, error: 'unauthorized' }, 401, origin);
+      }
+      const ref = url.searchParams.get('ref') || '';
+      let raw: string | null = null;
+      let err = '';
+      try {
+        if (url.searchParams.get('write') === '1') {
+          await env.APPLICATIONS.put(KV_KEY(ref), JSON.stringify({ ref, email: 'worker-write@brainsait.org', ts: Date.now() }));
+        }
+        raw = await env.APPLICATIONS.get(KV_KEY(ref));
+      } catch (e) {
+        err = String(e);
+      }
+      return jsonResponse({
+        ok: true,
+        ref,
+        key: KV_KEY(ref),
+        notionConfigured: notionConfigured(env),
+        rawLength: raw ? raw.length : 0,
+        rawPreview: raw ? raw.slice(0, 300) : null,
+        err,
+      }, 200, origin);
+    }
+
+    // EVENT ROUTER — other systems (Telegram bot, simulator, portal) POST here
+    // to update the central student state in D1 and trigger async fan‑out.
+    if (url.pathname.startsWith('/events/') && request.method === 'POST') {
+      const eventType = decodeURIComponent(url.pathname.slice('/events/'.length));
+      const body = (await request.json().catch(() => ({}))) as { student_email?: string; [k: string]: unknown };
+      if (!body.student_email) return jsonResponse({ ok: false, error: 'Missing student_email' }, 400, origin);
+      try {
+        await d1LogEvent(ctx, env, eventType, body.student_email, body);
+      } catch { /* best-effort */ }
+      return jsonResponse({ ok: true, event: eventType, student_email: body.student_email }, 200, origin);
+    }
+
+    // INSTALLMENT SYSTEM endpoints.
+    if (url.pathname.startsWith('/installment/') && request.method === 'GET') {
+      const ref = decodeURIComponent(url.pathname.slice('/installment/'.length));
+      const plan = await getInstallmentPlan(env, ref);
+      if (!plan) return jsonResponse({ ok: false, error: 'no installment plan' }, 404, null);
+      return jsonResponse({ ok: true, plan: planPublicView(plan) }, 200, null);
+    }
+    if (url.pathname.startsWith('/installment/') && request.method === 'POST') {
+      const ref = decodeURIComponent(url.pathname.slice('/installment/'.length));
+      const body = (await request.json().catch(() => ({}))) as { action?: string; reason?: string };
+      const plan = await getInstallmentPlan(env, ref);
+      if (!plan) return jsonResponse({ ok: false, error: 'no installment plan' }, 404, null);
+      if (body.action === 'suspend') {
+        plan.status = 'SUSPENDED';
+        plan.suspendedAt = new Date().toISOString();
+        plan.suspendedReason = body.reason || 'manual suspension';
+        await saveInstallmentPlan(env, plan);
+        await suspendPartnerAccess(env, plan, plan.suspendedReason, true);
+        return jsonResponse({ ok: true, status: 'suspended' }, 200, null);
+      }
+      if (body.action === 'resume') {
+        plan.status = 'ACTIVE';
+        plan.suspendedAt = undefined;
+        plan.suspendedReason = undefined;
+        await saveInstallmentPlan(env, plan);
+        await suspendPartnerAccess(env, plan, 'resumed', false);
+        await broadcastInstallment(env, plan, 'resumed', 'manual resume');
+        return jsonResponse({ ok: true, status: 'active' }, 200, null);
+      }
+      return jsonResponse({ ok: false, error: 'unknown action' }, 400, null);
     }
 
     if (url.pathname === '/bot/standup' && request.method === 'POST') {

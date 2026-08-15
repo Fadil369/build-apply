@@ -10,15 +10,16 @@ routes = [
 ]
 
 [triggers]
-crons = ["0 9 * * *"]
+crons = ["*/15 * * * *"]
 
 [[r2_buckets]]
 binding = "EVIDENCE_BUCKET"
 bucket_name = "build-evidence"
 
-[[kv_namespaces]]
-binding = "APPLICATIONS"
-id = "20ed085e26734a389d34d207ba830c97"
+[[d1_databases]]
+binding = "BUILD_DB"
+database_name = "build-students"
+database_id = "59354dc7-49b1-4a95-8728-59f144872307"
 
 [observability]
 enabled = true

@@ -13,5 +13,8 @@
     "@cloudflare/workers-types": "^4.20260702.1",
     "typescript": "^7.0.2",
     "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "pdf-lib": "^1.17.1"
   }
 }
