@@ -16,6 +16,10 @@ crons = ["*/15 * * * *"]
 binding = "EVIDENCE_BUCKET"
 bucket_name = "build-evidence"
 
+[[kv_namespaces]]
+binding = "APPLICATIONS"
+id = "20ed085e26734a389d34d207ba830c97"
+
 [[d1_databases]]
 binding = "BUILD_DB"
 database_name = "build-students"

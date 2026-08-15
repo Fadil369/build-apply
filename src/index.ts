@@ -1976,6 +1976,14 @@ async function provisionPaidApplication(env: Env, order: any, appRef: string, or
   // Certificate may already be issuable (e.g. milestones seeded earlier).
   try { await checkAndIssueCertificate(env, candidate, appRef); } catch { /* best-effort */ }
 
+  // Central D1 student state — mark paid/active (preserves any existing day).
+  try {
+    await d1UpsertStudent(env, payload.email || orderEmail || '', {
+      status: 'active',
+      shopify_order_id: String(order.id || ''),
+    });
+  } catch { /* best-effort */ }
+
   // Real, isolated GitHub repo per paid candidate — Phase 1 of the BUILD
   // access model. Uses the GitHub username collected at intake; works for both
   // Notion-backed and KV-backed applications.
@@ -4046,6 +4054,18 @@ async function handleApply(request: Request, env: Env): Promise<Response> {
       tasks: notionPage ? [] : kvInitialTasks(),
     };
     await kvPut(env, kvApp);
+
+    // Central D1 student state — single source of truth across the ecosystem
+    // (Telegram, email, simulator, commerce pulse, subscriptions).
+    try {
+      await d1UpsertStudent(env, payload.email, {
+        telegram_chat_id: null,
+        notion_page_id: notionPage?.id || null,
+        current_day: 0,
+        status: 'pending',
+        certificates_earned: '[]',
+      });
+    } catch { /* best-effort — KV/Notion remain authoritative */ }
 
     // Register the applicant as a Shopify customer (opt-in to email marketing)
     // so every BUILD applicant appears in the store's messaging centre.
