@@ -1,5 +1,6 @@
 import { BUILD_CURRICULUM, curriculumForDay, curriculumDayForProgramStart } from './curriculum';
 import { generateCertificatePdf } from './certificate-pdf';
+import { badgeSvg, badgePageHtml, openBadgeCredential, badgeClassImageSvg, badgeClassForTrack, badgeClassSlug, type BadgeData } from './open-badge';
 import { signCertificateWithAdobe } from './adobe-sign';
 
 export interface Env {
@@ -37,6 +38,10 @@ export interface Env {
   ADOBE_SIGN_CLIENT_SECRET?: string;
   ADOBE_SIGN_BASE?: string;
   ADOBE_SIGN_SIGNER_EMAIL?: string;
+  // brainsait-notify (Identity Cloud) — OID issuance + OTP/magic-link, shared
+  // internal admin key (same value configured as NOTIFY_API_KEY on that
+  // service, gives no-quota "internal" auth per its own _auth() convention).
+  NOTIFY_API_KEY?: string;
 }
 
 interface KvTask {
@@ -138,6 +143,7 @@ interface InstallmentPlan {
   installments: Installment[];
   status: 'ACTIVE' | 'COMPLETED' | 'SUSPENDED';
   createdAt: string;
+  lang?: 'ar' | 'en';
   suspendedAt?: string;
   suspendedReason?: string;
 }
@@ -161,15 +167,16 @@ const INSTALLMENT_DEFS: Record<string, { label: string; share: number }[]> = {
   ],
 };
 
-function buildInstallmentSchedule(ref: string, email: string, fullName: string, phone: string | undefined, plan: string, total: number, today = new Date()): InstallmentPlan {
+function buildInstallmentSchedule(ref: string, email: string, fullName: string, phone: string | undefined, plan: string, total: number, today = new Date(), lang: 'ar' | 'en' = 'en'): InstallmentPlan {
   const defs = INSTALLMENT_DEFS[plan] || INSTALLMENT_DEFS.full;
   const now = today.toISOString();
-  // Compute non-final amounts from the share, then make the LAST installment
-  // absorb the rounding remainder so the schedule always sums EXACTLY to total
-  // (e.g. quarter: 2408 + 2408 + 2407 + 2407 = 9630, not 9632).
-  const amounts: number[] = defs.map((d, i) => (i === defs.length - 1 ? 0 : Math.round(d.share * total)));
+  // Compute non-final amounts from the share (rounded to the halala), then make
+  // the LAST installment absorb the remainder so the schedule sums EXACTLY to
+  // total. Quarter now splits cleanly: 2,407.50 × 4 = 9,630 (was 2,408×3+2,406).
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  const amounts: number[] = defs.map((d, i) => (i === defs.length - 1 ? 0 : round2(d.share * total)));
   const paidSoFar = amounts.reduce((a, b) => a + b, 0);
-  amounts[amounts.length - 1] = total - paidSoFar;
+  amounts[amounts.length - 1] = round2(total - paidSoFar);
   const installments: Installment[] = defs.map((d, i) => {
     const due = new Date(now);
     due.setUTCDate(due.getUTCDate() + (i === 0 ? 0 : 30 * i));
@@ -184,7 +191,7 @@ function buildInstallmentSchedule(ref: string, email: string, fullName: string, 
   });
   return {
     ref, email, fullName, phone, plan: plan as InstallmentPlan['plan'], total, installments,
-    status: 'ACTIVE', createdAt: now,
+    status: 'ACTIVE', createdAt: now, lang,
   };
 }
 
@@ -205,13 +212,17 @@ function refKey(ref: string): string {
 
 function installmentPaymentUrl(env: Env, appRef: string, plan: InstallmentPlan, no: number): string {
   const inst = plan.installments.find((x) => x.no === no) || plan.installments[0];
-  const variantId = SHOPIFY_VARIANTS.standard;
+  // Route to the plan-specific Shopify product so the cart charges the EXACT
+  // installment amount (each plan is its own product page in the store).
+  const variantId = INSTALLMENT_VARIANTS[plan.plan] || INSTALLMENT_VARIANTS.full;
   const shop = env.SHOPIFY_STORE_DOMAIN || 'store.brainsait.org';
   const params = new URLSearchParams();
   params.set('id', variantId);
   params.set('quantity', '1');
   params.set('properties[eligibility_tier]', 'standard');
-  params.set('properties[final_price]', String(inst.amount));
+  params.set('properties[final_price]', String(plan.total));
+  params.set('properties[installment_amount]', String(inst.amount));
+  params.set('properties[installment_plan]', plan.plan);
   params.set('properties[application_ref]', appRef);
   params.set('properties[installment_ref]', `inst-${appRef}-${no}`);
   params.set('properties[installment_no]', String(no));
@@ -302,34 +313,66 @@ async function planStatusForRef(env: Env, appRef: string): Promise<string | unde
 
 /** Send an installment reminder via email + SMS (best-effort). */
 async function sendInstallmentReminder(env: Env, plan: InstallmentPlan, inst: Installment, stage: number): Promise<void> {
+  const ar = plan.lang === 'ar';
   const daysOver = Math.max(0, Math.floor((Date.now() - new Date(inst.dueAt).getTime()) / 86400000));
   const paymentUrl = installmentPaymentUrl(env, plan.ref, plan, inst.no);
-  const subject = stage <= 2
-    ? (plan.plan === 'full' ? 'Your BrainSAIT BUILD Ticket payment' : `BUILD Ticket — ${inst.label} due`)
-    : `⚠️ ${inst.label} overdue — action required`;
+  const dueStr = inst.dueAt.slice(0, 10);
 
-  const messages: Record<number, { title: string; body: string }> = {
-    0: { title: 'Reminder', body: `This is a friendly reminder that your ${inst.label} (SAR ${inst.amount}) is due on ${inst.dueAt.slice(0, 10)}.` },
-    1: { title: 'Payment due tomorrow', body: `Your ${inst.label} of SAR ${inst.amount} is due tomorrow. Please complete it to keep your BUILD access active.` },
-    2: { title: 'Payment due today', body: `Your ${inst.label} of SAR ${inst.amount} is due TODAY. Complete payment now to avoid disruption.` },
-    3: { title: 'Payment overdue', body: `Your ${inst.label} of SAR ${inst.amount} is ${daysOver} day(s) overdue. Pay now to keep your account active.` },
-    4: { title: 'Final reminder', body: `This is your FINAL reminder. Your ${inst.label} of SAR ${inst.amount} is ${daysOver} day(s) overdue. If not paid within 7 days your account will be suspended.` },
-    5: { title: 'Suspension imminent', body: `Your account will be SUSPENDED in ${Math.max(0, 14 - daysOver)} day(s) unless you settle your overdue ${inst.label} (SAR ${inst.amount}).` },
-  };
+  const subject = ar
+    ? (stage <= 2 ? (plan.plan === 'full' ? 'دفعة تذكرة BUILD في BrainSAIT' : `تذكرة BUILD — استحقاق ${inst.label}`) : `⚠️ ${inst.label} متأخرة — مطلوب إجراء`)
+    : (stage <= 2
+      ? (plan.plan === 'full' ? 'Your BrainSAIT BUILD Ticket payment' : `BUILD Ticket — ${inst.label} due`)
+      : `⚠️ ${inst.label} overdue — action required`);
+
+  const messages: Record<number, { title: string; body: string }> = ar
+    ? {
+        0: { title: 'تذكير', body: `تذكير وديّ بأن ${inst.label} (${inst.amount} ريال) مستحقة في ${dueStr}.` },
+        1: { title: 'الدفع مستحق غداً', body: `دفعة ${inst.label} بقيمة ${inst.amount} ريال مستحقة غداً. يرجى سدادها للحفاظ على وصولك إلى BUILD.` },
+        2: { title: 'الدفع مستحق اليوم', body: `دفعة ${inst.label} بقيمة ${inst.amount} ريال مستحقة اليوم. أكمل الدفع الآن لتفادي الانقطاع.` },
+        3: { title: 'الدفعة متأخرة', body: `دفعة ${inst.label} بقيمة ${inst.amount} ريال متأخرة ${daysOver} يوماً. ادفع الآن للحفاظ على نشاط حسابك.` },
+        4: { title: 'تذكير أخير', body: `هذا التذكير الأخير. دفعة ${inst.label} بقيمة ${inst.amount} ريال متأخرة ${daysOver} يوماً. إن لم تُسدَّد خلال ٧ أيام سيتوقّف حسابك.` },
+        5: { title: 'التعليق وشيك', body: `سيتوقّف حسابك خلال ${Math.max(0, 14 - daysOver)} يوماً ما لم تسوّي دفعة ${inst.label} المتأخرة (${inst.amount} ريال).` },
+      }
+    : {
+        0: { title: 'Reminder', body: `This is a friendly reminder that your ${inst.label} (SAR ${inst.amount}) is due on ${dueStr}.` },
+        1: { title: 'Payment due tomorrow', body: `Your ${inst.label} of SAR ${inst.amount} is due tomorrow. Please complete it to keep your BUILD access active.` },
+        2: { title: 'Payment due today', body: `Your ${inst.label} of SAR ${inst.amount} is due TODAY. Complete payment now to avoid disruption.` },
+        3: { title: 'Payment overdue', body: `Your ${inst.label} of SAR ${inst.amount} is ${daysOver} day(s) overdue. Pay now to keep your account active.` },
+        4: { title: 'Final reminder', body: `This is your FINAL reminder. Your ${inst.label} of SAR ${inst.amount} is ${daysOver} day(s) overdue. If not paid within 7 days your account will be suspended.` },
+        5: { title: 'Suspension imminent', body: `Your account will be SUSPENDED in ${Math.max(0, 14 - daysOver)} day(s) unless you settle your overdue ${inst.label} (SAR ${inst.amount}).` },
+      };
 
   const m = messages[Math.min(stage, 5)] || messages[0];
-  const html = `<div style="font-family:system-ui,sans-serif;max-width:600px;margin:0 auto;line-height:1.6;">
-    <h2 style="color:#131320;">${m.title}</h2>
-    <p>Hi ${escapeHtml(plan.fullName || plan.email.split('@')[0])},</p>
-    <p>${m.body}</p>
-    <p><strong>Due amount:</strong> SAR ${inst.amount}<br/>
-       <strong>Due date:</strong> ${inst.dueAt.slice(0, 10)}<br/>
-       <strong>Application:</strong> ${plan.ref}</p>
-    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#e9c46a;border-radius:999px;padding:13px 30px;">
-      <a href="${paymentUrl}" style="color:#131320;text-decoration:none;font-weight:700;font-size:14px;">Pay now →</a>
-    </td></tr></table>
-    <p style="color:#666;font-size:13px;">Your BUILD access stays active while you are current on installments. Unpaid balances past 14 days trigger account suspension.</p>
-  </div>`;
+  let html: string;
+  if (ar) {
+    html = luxuryEmailShell(subject, `
+      <p style="margin:0 0 14px;font-size:17px;color:#131320;"><b>${m.title}</b></p>
+      <p style="margin:0 0 16px;">مرحباً ${escapeHtml(plan.fullName || plan.email.split('@')[0])}،</p>
+      <p style="margin:0 0 16px;">${m.body}</p>
+      <p style="margin:0 0 16px;color:#444;font-size:14px;"><strong>المبلغ المستحق:</strong> ${inst.amount} ريال<br/>
+         <strong>تاريخ الاستحقاق:</strong> ${dueStr}<br/>
+         <strong>رقم الطلب:</strong> ${plan.ref}</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:13px 30px;">
+        <a href="${paymentUrl}" style="color:#131320;text-decoration:none;font-weight:700;font-size:14px;">ادفع الآن ←</a>
+      </td></tr></table>
+      <p style="margin:0 0 8px;color:#666;font-size:13px;">يظل وصولك إلى BUILD نشطاً ما دمت ملتزماً بالأقساط. الرصيد غير المدفوع بعد ١٤ يوماً يؤدي إلى تعليق الحساب.</p>
+      <p style="margin:0;color:#666;font-size:13px;">تابع أقساطك وإنجازاتك على <a href="${BUILD_TRACK_URL}?ref=${encodeURIComponent(plan.ref)}" style="color:#8a6d1f;">لوحة التقدّم</a> · رفيقك <a href="${FORGE_BOT_URL}" style="color:#8a6d1f;">@brainsait_forge_bot</a>.</p>
+    `, '', 'ar');
+  } else {
+    html = luxuryEmailShell(subject, `
+      <p style="margin:0 0 14px;font-size:17px;color:#131320;"><b>${m.title}</b></p>
+      <p style="margin:0 0 16px;">Hi ${escapeHtml(plan.fullName || plan.email.split('@')[0])},</p>
+      <p style="margin:0 0 16px;">${m.body}</p>
+      <p style="margin:0 0 16px;color:#444;font-size:14px;"><strong>Due amount:</strong> SAR ${inst.amount}<br/>
+         <strong>Due date:</strong> ${dueStr}<br/>
+         <strong>Application:</strong> ${plan.ref}</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:13px 30px;">
+        <a href="${paymentUrl}" style="color:#131320;text-decoration:none;font-weight:700;font-size:14px;">Pay now →</a>
+      </td></tr></table>
+      <p style="margin:0 0 8px;color:#666;font-size:13px;">Your BUILD access stays active while you are current on installments. Unpaid balances past 14 days trigger account suspension.</p>
+      <p style="margin:0;color:#666;font-size:13px;">Track your installments on your <a href="${BUILD_TRACK_URL}?ref=${encodeURIComponent(plan.ref)}" style="color:#8a6d1f;">progress dashboard</a> · your buddy <a href="${FORGE_BOT_URL}" style="color:#8a6d1f;">@brainsait_forge_bot</a>.</p>
+    `, '', 'en');
+  }
 
   if (env.RESEND_API_KEY && plan.email) {
     try {
@@ -344,11 +387,13 @@ async function sendInstallmentReminder(env: Env, plan: InstallmentPlan, inst: In
   // SMS (via the ecosystem hub — Twilio → KonsoleH → email fallback).
   if (plan.phone) {
     try {
+      const smsAr = `BrainSAIT BUILD: ${m.title}. ${inst.label} ${inst.amount} ريال مستحقة ${dueStr}. ادفع للحفاظ على الوصول: ${paymentUrl}`;
+      const smsEn = `BrainSAIT BUILD: ${m.title}. ${inst.label} SAR ${inst.amount} due ${dueStr}. Pay to keep access: ${paymentUrl}`;
       await emitHubEvent(env, {
         type: 'installment.reminder',
         source: 'build-apply',
         notify_sms: true,
-        sms_text: `BrainSAIT BUILD: ${m.title}. ${inst.label} SAR ${inst.amount} due ${inst.dueAt.slice(0, 10)}. Pay to keep access: ${paymentUrl}`.slice(0, 160),
+        sms_text: (ar ? smsAr : smsEn).slice(0, 160),
         data: { applicationId: plan.ref, installmentNo: inst.no, amount: inst.amount, stage, paymentUrl },
       });
     } catch { /* best-effort */ }
@@ -480,8 +525,14 @@ const ULTIMATE_BRAIN_BUILD_URL = 'https://fadil369.notion.site/Ultimate-Brain-30
 const CALENDAR_URL = 'https://calendar.app.google/rAqiE6pNumtECdnd7';
 const SPARK_URL = 'https://spark.brainsait.org';
 const GTM_PLAYBOOK_URL = 'https://gtm.brainsait.org';
-const ACCOUNT_URL = 'https://account.brainsait.org';
+// account.brainsait.org is a Shopify customer-account custom domain that
+// still shows Shopify's own /password wall (unlaunched, confirmed live
+// 2026-08-19) — the real, working My Account page is the React app below.
+const ACCOUNT_URL = 'https://fadil369.github.io/account';
 const BUILD_TRACK_URL = 'https://fadil369.github.io/track';
+const FORGE_BOT_URL = 'https://t.me/brainsait_forge_bot';
+// brainsait-notify ("BrainSAIT Identity Cloud") — OID issuance + OTP/magic-link.
+const NOTIFY_BASE = 'https://notify.brainsait.de';
 const BUILD_CERT_BASE = 'https://build-apply.brainsait.org';
 const GITHUB_PROFILE_URL = 'https://github.com';
 // Canva Design Registry — the design/visual layer of the BUILD program.
@@ -601,6 +652,21 @@ const SHOPIFY_VARIANTS: Record<string, string> = {
   standard: '45947217870931',
 };
 
+// Four BUILD Ticket Shopify products — one per installment plan. Each is its
+// own product page in the store and carries the EXACT per-installment amount,
+// so the cart always charges the correct figure for the selected plan:
+//   full    → build-ticket               @ 9,630.00  (1 payment)
+//   flex    → build-ticket-half-payment  @ 4,815.00  (2 payments)
+//   split   → build-ticket-third-payment @ 3,210.00  (3 payments)
+//   quarter → build-ticket-quarter-payment @ 2,407.50 (4 payments)
+// Verified live 2026-08-16 (created via Admin API; handles + variant IDs below).
+const INSTALLMENT_VARIANTS: Record<string, string> = {
+  full: '45947217870931',
+  flex: '45981983473747',
+  split: '45982004576339',
+  quarter: '45982004609107',
+};
+
 const FOUNDER_OS_TRACKS: Record<string, { name: string; url: string }> = {
   standard: { name: 'Founder Accelerator', url: 'https://app.notion.com/p/3ba3479c6f62812aafb8e61f1e0eea75' },
 };
@@ -651,7 +717,7 @@ const ALLOWED_EVIDENCE_TYPES = new Set([
 function corsHeaders(origin: string | null): Record<string, string> {
   const headers: Record<string, string> = {
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Token',
     'Access-Control-Max-Age': '86400',
   };
   if (origin && ALLOWED_ORIGINS.includes(origin)) {
@@ -666,6 +732,42 @@ function jsonResponse(body: unknown, status = 200, origin: string | null = null)
     status,
     headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) },
   });
+}
+
+/**
+ * KV-backed rate limiter — abuse guard for public, side-effectful endpoints
+ * (/apply spawns real GitHub repos; OTP requests cost money; /pixel writes D1).
+ * Eventual consistency is acceptable: this is mitigation, not billing.
+ */
+async function rateLimit(
+  env: Env,
+  request: Request,
+  bucket: string,
+  max: number,
+  windowSec: number,
+): Promise<{ ok: true } | { ok: false; retryAfter: number }> {
+  const ip =
+    request.headers.get('cf-connecting-ip') ||
+    request.headers.get('x-forwarded-for')?.split(',')[0].trim() ||
+    'unknown';
+  const key = `rl:${bucket}:${ip}`;
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    const raw = await env.APPLICATIONS.get(key);
+    let entry: { c: number; w: number } = { c: 0, w: now };
+    if (raw) {
+      try { entry = JSON.parse(raw); } catch { /* reset below */ }
+    }
+    if (now - entry.w >= windowSec) entry = { c: 0, w: now };
+    entry.c += 1;
+    await env.APPLICATIONS.put(key, JSON.stringify(entry), { expirationTtl: windowSec + 5 });
+    if (entry.c > max) {
+      return { ok: false, retryAfter: Math.max(1, windowSec - (now - entry.w)) };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: true }; // fail-open: never block revenue on limiter errors
+  }
 }
 
 interface EligibilityData {
@@ -876,21 +978,21 @@ async function sendConfirmationEmail(
     : 'Your BrainSAIT Incubation Application Was Received';
 
   const html = ar
-    ? `<div dir="rtl" style="font-family:system-ui,sans-serif;max-width:600px;margin:0 auto;line-height:1.6;">
-        <h2 style="color:#131320;">مرحباً ${escapeHtml(payload.fullName)} 👋</h2>
-        <p>استلمنا طلبك بنجاح. إليك ملخص تذكرة البناء:</p>
-        <ul>
-          <li><strong>التذكرة:</strong> ${escapeHtml(tierTitle)} — سعر موحد للجميع</li>
+    ? luxuryEmailShell(subject, `
+        <p style="margin:0 0 14px;font-size:17px;color:#131320;"><b>مرحباً ${escapeHtml(payload.fullName)} 👋</b></p>
+        <p style="margin:0 0 16px;">استلمنا طلبك بنجاح. إليك ملخّص تذكرة البناء:</p>
+        <ul style="margin:0 0 16px;padding-right:20px;color:#444;font-family:Arial,sans-serif;font-size:14px;line-height:1.8;">
+          <li><strong>التذكرة:</strong> ${escapeHtml(tierTitle)} — سعر موحّد للجميع</li>
           ${originalLine}
           <li><strong>السعر النهائي:</strong> ${priceText}</li>
           <li><strong>رقم الطلب:</strong> ${appRef}</li>
           ${promoLine}
         </ul>
-        <p style="margin:1rem 0;"><a href="${SMART_MATCHER_URL}">اكتشف مسارك الأمثل عبر Smart Program Matcher →</a></p>
-        ${checkoutUrl ? `<p style="margin:1.5rem 0;"><a href="${checkoutUrl}" style="background:#e9c46a;color:#131320;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:700;">إتمام الدفع</a></p>` : ''}
-        <p style="margin:1rem 0 0;color:#666;font-size:0.9rem;">بعد الدفع: يُفتح حسابك، صفحة الإعداد في Notion، ومستودع GitHub الخاص بك تلقائياً.</p>
-        ${notionUrl ? `<p style="color:#666;font-size:0.9rem;">يمكنك متابعة حالة طلبك في Notion: <a href="${notionUrl}">${notionUrl}</a></p>` : ''}
-      </div>`
+        <p style="margin:1rem 0;"><a href="${SMART_MATCHER_URL}" style="color:#8a6d1f;">اكتشف مسارك الأمثل عبر Smart Program Matcher ←</a></p>
+        ${checkoutUrl ? `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:14px 34px;"><a href="${checkoutUrl}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:15px;">إتمام الدفع</a></td></tr></table>` : ''}
+        <p style="margin:1rem 0 0;color:#666;font-size:0.9rem;">بعد الدفع يُفتح حسابك، وصفحة الإعداد في Notion، ومستودع GitHub الخاص بك تلقائياً — ثم يرافقك بوت Forge: <a href="${FORGE_BOT_URL}" style="color:#8a6d1f;">@brainsait_forge_bot</a>.</p>
+        ${notionUrl ? `<p style="color:#666;font-size:0.9rem;">تابع حالة طلبك في Notion: <a href="${notionUrl}">${notionUrl}</a></p>` : ''}
+      `, '', 'ar')
     : `<div style="font-family:system-ui,sans-serif;max-width:600px;margin:0 auto;line-height:1.6;">
         <h2 style="color:#131320;">Hi ${escapeHtml(payload.fullName)} 👋</h2>
         <p>We received your application successfully. Here's your Build Ticket summary:</p>
@@ -1842,6 +1944,60 @@ async function handleShopifyWebhook(request: Request, env: Env, ctx: ExecutionCo
 }
 
 /**
+ * Onboard a paying LEARN customer: issue a BrainSAIT OID, register them into
+ * Shopify/master-Contacts/D1, mint a 7-day claim token (powers both the
+ * Order Status Page auto-redirect and the welcome email's link), and send
+ * the welcome email. Skips entirely if every resolvable line item is
+ * SOLUTIONS-type (out of scope for now) or if nothing resolves at all
+ * (unknown products — safer to do nothing than guess). Best-effort/never
+ * throws — the caller already wraps this in a try/catch.
+ */
+async function onboardLearnCustomer(env: Env, order: any, email: string, firstName: string): Promise<void> {
+  const resolved = await resolveOrderProducts(env, order);
+  if (!resolved.anyResolved || resolved.solutionsOnly) return;
+
+  const name = firstName || (email.split('@')[0]) || 'Customer';
+  const oid = await issueOid(env, { email, name, role: 'learn-customer' });
+
+  const orderKey = String(order.admin_graphql_api_id || order.id || '');
+  const phone = String(order.customer?.phone || order.phone || '') || undefined;
+
+  const profile: CustomerProfile = { email, name, oid, products: resolved.learnProducts };
+  const claimToken = await mintClaimToken(env, profile, orderKey);
+
+  try {
+    await syncShopifyCustomer(env, {
+      email, fullName: name, phone,
+      tags: ['learn-customer', ...resolved.learnProducts.map((p) => `product:${p.slug}`)],
+    }, false);
+  } catch { /* best-effort */ }
+
+  try {
+    await syncMasterContact(env, {
+      name, email, phone,
+      tags: ['learn-customer', ...resolved.learnProducts.map((p) => `product:${p.slug}`)],
+      sourceSystem: 'shopify-learn',
+      sourceId: orderKey,
+      notes: oid ? `BrainSAIT OID: ${oid}` : undefined,
+    });
+  } catch { /* best-effort */ }
+
+  try {
+    await d1UpsertStudent(env, email, { status: 'learn-customer', shopify_order_id: orderKey, oid: oid || null, full_name: name });
+  } catch { /* best-effort */ }
+
+  if (env.RESEND_API_KEY) {
+    try {
+      await sendLearnWelcomeEmail(env, email, name, { claimToken, oid, products: resolved.learnProducts });
+    } catch (e) { console.error(`sendLearnWelcomeEmail failed: ${e}`); }
+  }
+
+  try {
+    await emitHubEvent(env, { type: 'learn.customer.onboarded', source: 'build-apply', data: { email, oid, products: resolved.learnProducts.map((p) => p.slug) } });
+  } catch { /* best-effort */ }
+}
+
+/**
  * Post-purchase BUILD upsell — when a customer buys a LEARN product (a book
  * or novel), gently invite them to graduate from "reader" to "builder" with
  * the BUILD incubation program. Three coordinated side-effects:
@@ -1857,6 +2013,13 @@ async function handlePostPurchaseUpsell(env: Env, order: any): Promise<void> {
   // The BUILD ticket is handled by the main provisioning path — skip it here.
   if (titles.some((t: string) => /BUILD|incubation/i.test(t))) return;
   const firstName = String((order.customer?.first_name) || '').trim();
+
+  // Onboard the customer (OID + OTP-ready account + registration) — SOLUTIONS
+  // is explicitly out of scope for now, so a purely-SOLUTIONS order is left
+  // to the plain upsell email below, nothing else.
+  try {
+    await onboardLearnCustomer(env, order, email, firstName);
+  } catch (e) { console.error(`onboardLearnCustomer failed: ${e}`); }
 
   // 1. Log to D1 central event state.
   try {
@@ -1986,6 +2149,21 @@ async function provisionPaidApplication(env: Env, order: any, appRef: string, or
     });
   } catch { /* best-effort */ }
 
+  // BrainSAIT identity: permanent OID + a 7-day claim token so the customer
+  // lands signed-in on /account immediately (Order Status Page redirect and
+  // the welcome email both carry this same token).
+  const buildOid = await issueOid(env, { email: payload.email || orderEmail || '', name: payload.fullName || 'Founder', role: 'build-customer' });
+  try {
+    await d1UpsertStudent(env, payload.email || orderEmail || '', { oid: buildOid || null, full_name: payload.fullName || 'Founder' });
+  } catch { /* best-effort */ }
+  const buildOrderKey = String(order.admin_graphql_api_id || order.id || '');
+  const buildClaimToken = await mintClaimToken(env, {
+    email: payload.email || orderEmail || '',
+    name: payload.fullName || 'Founder',
+    oid: buildOid,
+    buildRef: appRef,
+  }, buildOrderKey);
+
   // Real, isolated GitHub repo per paid candidate — Phase 1 of the BUILD
   // access model. Uses the GitHub username collected at intake; works for both
   // Notion-backed and KV-backed applications.
@@ -2022,7 +2200,7 @@ async function provisionPaidApplication(env: Env, order: any, appRef: string, or
 
   if (env.RESEND_API_KEY && payload.email) {
     try {
-      await sendPaidWelcomeEmail(env, payload.email, payload.fullName || 'Founder', appRef);
+      await sendPaidWelcomeEmail(env, payload.email, payload.fullName || 'Founder', appRef, buildClaimToken, buildOid, payload.lang === 'ar' ? 'ar' : 'en');
     } catch { /* best-effort */ }
   }
 
@@ -2037,6 +2215,7 @@ async function provisionPaidApplication(env: Env, order: any, appRef: string, or
       fullName: payload.fullName || 'Founder',
       appRef,
       githubUsername: githubUsername || '',
+      lang: payload.lang === 'ar' ? 'ar' : 'en',
     });
   } catch (err) { console.error(`sendTelegramWelcome failed for ${appRef}: ${err}`); }
 
@@ -2156,46 +2335,146 @@ async function provisionPaidApplication(env: Env, order: any, appRef: string, or
   return jsonResponse({ ok: true, applicationId: appRef, status: 'paid & approved' }, 200, origin);
 }
 
-async function sendPaidWelcomeEmail(env: Env, email: string, name: string, appRef: string): Promise<void> {
+async function sendPaidWelcomeEmail(
+  env: Env,
+  email: string,
+  name: string,
+  appRef: string,
+  claimToken?: string,
+  oid?: string,
+  lang: 'ar' | 'en' = 'en',
+): Promise<void> {
+  const ar = lang === 'ar';
   const trackUrl = `${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}`;
-  const body = `
-    <p style="margin:0 0 14px;font-size:17px;color:#131320;"><b>🎉 Welcome, ${escapeHtml(name)}</b></p>
-    <p style="margin:0 0 16px;">Your payment is confirmed and your seat is <b>approved</b>. You are officially a BrainSAIT partner now — and a very valuable one.</p>
-    <p style="margin:0 0 10px;color:#131320;"><b>🎁 Your Second Brain is waiting</b> — the gift we promised to those who use their first brain very well. It is organized, connected, and alive: 15 days, 18 labs, 16 milestones.</p>
-    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:14px 34px;">
-      <a href="${SECOND_BRAIN_URL}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:15px;">Open your Second Brain 🧠</a>
-    </td></tr></table>
-    <p style="margin:0 0 10px;color:#131320;"><b>🚀 Your Founder OS incubator course is live</b> — from idea to company, the full founder operating system.</p>
-    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
-      <a href="${FOUNDER_OS_URL}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Start Founder OS →</a>
-    </td></tr></table>
-    <p style="margin:0 0 10px;color:#131320;"><b>🧠 Your BUILD Ultimate Brain (2nd Brain)</b> — the Arabic incubator edition with your onboarding board, milestones and lab simulators.</p>
-    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
-      <a href="${ULTIMATE_BRAIN_BUILD_URL}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Open your BUILD 2nd Brain →</a>
-    </td></tr></table>
-    <p style="margin:0 0 10px;color:#131320;"><b>📅 Need a bigger discount or an adjusted plan?</b> <a href="${CALENDAR_URL}" style="color:#8a6d1f;">Book a 1:1 evaluation</a> — 30 minutes with the founder.</p>
-    <p style="margin:0 0 10px;color:#131320;"><b>🧑‍💻 Everything is already set up for you</b> — all automated the moment your payment landed:</p>
-    <ul style="margin:0 0 16px;padding-left:20px;color:#444;font-family:Arial,sans-serif;font-size:14px;line-height:1.8;">
-      <li><b>Notion onboarding</b> — your application page and milestone board are live, all 16 milestones seeded.</li>
-      <li><b>GitHub repo</b> — your own repository generated from the BUILD starter, with you added as a collaborator (when a GitHub username was provided at intake).</li>
-      <li><b>Customer account</b> — your Shopify customer account (via the Partner API) is tagged as a build partner.</li>
-      <li><b>Daily standups</b> — a task is created for you every working day; complete it on your Notion board or from your dashboard.</li>
-    </ul>
-    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
-      <a href="${trackUrl}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Open your progress dashboard →</a>
-    </td></tr></table>
-    <p style="margin:0 0 10px;color:#131320;"><b>📈 Your builder profile</b> — connected to your Shopify customer account at <a href="${ACCOUNT_URL}" style="color:#8a6d1f;">account.brainsait.org</a>. Track your progress, showcase your proof, ship your product.</p>
-    <hr style="border:none;border-top:1px solid #e5ddc4;margin:20px 0;" />
-    <p style="margin:0;color:#666;font-size:13px;font-family:Arial,sans-serif;">Application <b>${appRef}</b> · Track progress at <a href="${trackUrl}" style="color:#8a6d1f;">${trackUrl}</a></p>
-  `;
-  const html = luxuryEmailShell('Your BrainSAIT partner seat is active 🎉', body);
+  const accountUrl = claimToken ? `${ACCOUNT_URL}?claim=${encodeURIComponent(claimToken)}` : ACCOUNT_URL;
+  const oidLine = oid
+    ? `<p style="margin:0 0 10px;color:#131320;"><b>🪪 هويتك في BrainSAIT</b> — رقم OID دائم: <code style="background:#f4f4f4;padding:2px 8px;border-radius:4px;">${escapeHtml(oid)}</code>.</p>`
+    : '';
+
+  let body: string;
+  let subject: string;
+  if (ar) {
+    subject = '🎉 تم تفعيل مقعد الشراكة في BrainSAIT — دماغك الثاني بين يديك';
+    body = `
+      <p style="margin:0 0 14px;font-size:17px;color:#131320;"><b>🎉 أهلاً بك، ${escapeHtml(name)}</b></p>
+      <p style="margin:0 0 16px;">وصلتنا دفعتك وأُقرّت مقعدك، وأصبحت رسمياً شريكاً في BrainSAIT — وشريكاً ذا قيمة عالية.</p>
+      ${oidLine}
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:14px 34px;">
+        <a href="${accountUrl}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:15px;">افتح حسابي 🪪</a>
+      </td></tr></table>
+      <p style="margin:0 0 10px;color:#131320;"><b>🎁 دماغك الثاني بانتظارك</b> — الهدية التي وعدنا بها مَن يُحسن استخدام دماغه الأول. منظّم ومترابط وحيّ: ١٥ يوماً، ١٨ معملاً، و١٦ محطّة.</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:14px 34px;">
+        <a href="${SECOND_BRAIN_URL}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:15px;">افتح دماغك الثاني 🧠</a>
+      </td></tr></table>
+      <p style="margin:0 0 10px;color:#131320;"><b>🚀 برنامج Founder OS للاحتضان متاح الآن</b> — من الفكرة إلى الشركة، نظام التشغيل الكامل للمؤسّس.</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
+        <a href="${FOUNDER_OS_URL}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">ابدأ Founder OS ←</a>
+      </td></tr></table>
+      <p style="margin:0 0 10px;color:#131320;"><b>🧠 دماغ البناء النهائي (2nd Brain)</b> — النسخة العربية للاحتضان: لوحة إعدادك، ومحطّاتك، ومحاكيات المعامل.</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
+        <a href="${ULTIMATE_BRAIN_BUILD_URL}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">افتح دماغ البناء ←</a>
+      </td></tr></table>
+      <p style="margin:0 0 10px;color:#131320;"><b>🤖 بوت Forge المصاحب</b> — رفيقك الشخصي للمتابعة والإنجاز: <a href="${FORGE_BOT_URL}" style="color:#8a6d1f;">@brainsait_forge_bot</a>.</p>
+      <p style="margin:0 0 10px;color:#131320;"><b>📅 تريد خصماً أكبر أو خطة مُعدّلة؟</b> <a href="${CALENDAR_URL}" style="color:#8a6d1f;">احجز تقييماً خاصاً</a> — ٣٠ دقيقة مع المؤسّس.</p>
+      <p style="margin:0 0 10px;color:#131320;"><b>🧑‍💻 كل شيء أُعدّ لك تلقائياً</b> — منذ لحظة وصول دفعتك:</p>
+      <ul style="margin:0 0 16px;padding-right:20px;color:#444;font-family:Arial,sans-serif;font-size:14px;line-height:1.8;">
+        <li><b>إعداد Notion</b> — صفحة طلبك ولوحة المحطّات مفعّلة، وجميع المحطّات الـ١٦ مزروعة.</li>
+        <li><b>مستودع GitHub</b> — مستودعك الخاص المولّد من بداية BUILD، مع إضافتك كمتعاون (عند توفير اسم المستخدم عند التسجيل).</li>
+        <li><b>حساب العميل</b> — حسابك في Shopify موسوم كشريك بناء عبر Partner API.</li>
+        <li><b>متابعة يومية</b> — مهمة تُنشأ لك كل يوم عمل؛ أنجزها من لوحة Notion أو من لوحة تحكّمك.</li>
+      </ul>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
+        <a href="${trackUrl}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">افتح لوحة تقدّمك ←</a>
+      </td></tr></table>
+      <p style="margin:0 0 10px;color:#131320;"><b>🏅 الشهادة والوسام</b> — عند إكمال برنامجك تُصدر شهادتك ووسام Open Badge تلقائياً، وتظهر في ملفّك.</p>
+      <p style="margin:0 0 10px;color:#131320;"><b>📈 ملفّك كصانع</b> — <a href="${accountUrl}" style="color:#8a6d1f;">حسابي</a> هو محورك: الهوية، الأقساط، والبرامج الأربعة المشمولة. تابع تقدّمك، واعرض إثباتك، وأطلق منتجك.</p>
+      <hr style="border:none;border-top:1px solid #e5ddc4;margin:20px 0;" />
+      <p style="margin:0;color:#666;font-size:13px;font-family:Arial,sans-serif;">الطلب <b>${appRef}</b> · حسابي: <a href="${accountUrl}" style="color:#8a6d1f;">${ACCOUNT_URL}</a> · متابعة الأقساط: <a href="${trackUrl}" style="color:#8a6d1f;">${trackUrl}</a></p>
+    `;
+  } else {
+    subject = '🎉 Your BrainSAIT partner seat is active — Second Brain inside';
+    body = `
+      <p style="margin:0 0 14px;font-size:17px;color:#131320;"><b>🎉 Welcome, ${escapeHtml(name)}</b></p>
+      <p style="margin:0 0 16px;">Your payment is confirmed and your seat is <b>approved</b>. You are officially a BrainSAIT partner now — and a very valuable one.</p>
+      ${oidLine}
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:14px 34px;">
+        <a href="${accountUrl}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:15px;">Open My Account 🪪</a>
+      </td></tr></table>
+      <p style="margin:0 0 10px;color:#131320;"><b>🎁 Your Second Brain is waiting</b> — the gift we promised to those who use their first brain very well. It is organized, connected, and alive: 15 days, 18 labs, 16 milestones.</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:14px 34px;">
+        <a href="${SECOND_BRAIN_URL}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:15px;">Open your Second Brain 🧠</a>
+      </td></tr></table>
+      <p style="margin:0 0 10px;color:#131320;"><b>🚀 Your Founder OS incubator course is live</b> — from idea to company, the full founder operating system.</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
+        <a href="${FOUNDER_OS_URL}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Start Founder OS →</a>
+      </td></tr></table>
+      <p style="margin:0 0 10px;color:#131320;"><b>🧠 Your BUILD Ultimate Brain (2nd Brain)</b> — the Arabic incubator edition with your onboarding board, milestones and lab simulators.</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
+        <a href="${ULTIMATE_BRAIN_BUILD_URL}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Open your BUILD 2nd Brain →</a>
+      </td></tr></table>
+      <p style="margin:0 0 10px;color:#131320;"><b>🤖 Your Forge companion bot</b> — your personal follow-up buddy: <a href="${FORGE_BOT_URL}" style="color:#8a6d1f;">@brainsait_forge_bot</a>.</p>
+      <p style="margin:0 0 10px;color:#131320;"><b>📅 Need a bigger discount or an adjusted plan?</b> <a href="${CALENDAR_URL}" style="color:#8a6d1f;">Book a 1:1 evaluation</a> — 30 minutes with the founder.</p>
+      <p style="margin:0 0 10px;color:#131320;"><b>🧑‍💻 Everything is already set up for you</b> — all automated the moment your payment landed:</p>
+      <ul style="margin:0 0 16px;padding-left:20px;color:#444;font-family:Arial,sans-serif;font-size:14px;line-height:1.8;">
+        <li><b>Notion onboarding</b> — your application page and milestone board are live, all 16 milestones seeded.</li>
+        <li><b>GitHub repo</b> — your own repository generated from the BUILD starter, with you added as a collaborator (when a GitHub username was provided at intake).</li>
+        <li><b>Customer account</b> — your Shopify customer account (via the Partner API) is tagged as a build partner.</li>
+        <li><b>Daily standups</b> — a task is created for you every working day; complete it on your Notion board or from your dashboard.</li>
+      </ul>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
+        <a href="${trackUrl}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Open your progress dashboard →</a>
+      </td></tr></table>
+      <p style="margin:0 0 10px;color:#131320;"><b>🏅 Certificate & badge</b> — on completing your program your certificate and Open Badge are issued automatically and shown on your profile.</p>
+      <p style="margin:0 0 10px;color:#131320;"><b>📈 Your builder profile</b> — <a href="${accountUrl}" style="color:#8a6d1f;">My Account</a> is your hub: identity, installments, and all 4 included programs. Track your progress, showcase your proof, ship your product.</p>
+      <hr style="border:none;border-top:1px solid #e5ddc4;margin:20px 0;" />
+      <p style="margin:0;color:#666;font-size:13px;font-family:Arial,sans-serif;">Application <b>${appRef}</b> · My Account: <a href="${accountUrl}" style="color:#8a6d1f;">${ACCOUNT_URL}</a> · Installment tracker: <a href="${trackUrl}" style="color:#8a6d1f;">${trackUrl}</a></p>
+    `;
+  }
+  const html = luxuryEmailShell(subject, body, '', lang);
   await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       from: env.RESEND_FROM_EMAIL || RESEND_FROM,
       to: email,
-      subject: '🎉 Your BrainSAIT partner seat is active — Second Brain inside',
+      subject,
+      html,
+    }),
+  });
+}
+
+async function sendLearnWelcomeEmail(env: Env, email: string, name: string, opts: {
+  claimToken: string;
+  oid?: string;
+  products: { slug: string; name: string; url: string }[];
+}): Promise<void> {
+  const accountUrl = `${ACCOUNT_URL}?claim=${encodeURIComponent(opts.claimToken)}`;
+  const productLinks = opts.products.length
+    ? opts.products.map((p) => `<li><a href="${p.url}" style="color:#8a6d1f;">${escapeHtml(p.name)}</a></li>`).join('')
+    : '<li>Check your account for your purchase.</li>';
+  const oidLine = opts.oid
+    ? `<p style="margin:0 0 10px;color:#131320;"><b>🪪 Your BrainSAIT identity</b> — permanent OID <code style="background:#f4f4f4;padding:2px 8px;border-radius:4px;">${escapeHtml(opts.oid)}</code>, your badge across the whole BrainSAIT ecosystem.</p>`
+    : '';
+  const body = `
+    <p style="margin:0 0 14px;font-size:17px;color:#131320;"><b>🎉 Welcome, ${escapeHtml(name)}</b></p>
+    <p style="margin:0 0 16px;">Your payment is confirmed — thank you for picking up something from the BrainSAIT library.</p>
+    ${oidLine}
+    <p style="margin:0 0 10px;color:#131320;"><b>📚 What you bought:</b></p>
+    <ul style="margin:0 0 16px;padding-left:20px;color:#444;font-family:Arial,sans-serif;font-size:14px;line-height:1.8;">${productLinks}</ul>
+    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:14px 34px;">
+      <a href="${accountUrl}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:15px;">Open My Account 🪪</a>
+    </td></tr></table>
+    <hr style="border:none;border-top:1px solid #e5ddc4;margin:20px 0;" />
+    <p style="margin:0;color:#666;font-size:13px;font-family:Arial,sans-serif;">This link works for the next 7 days. After that, request a fresh sign-in code from <a href="${ACCOUNT_URL}" style="color:#8a6d1f;">My Account</a> any time.</p>
+  `;
+  const html = luxuryEmailShell('Your BrainSAIT order is confirmed 🎉', body);
+  await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: env.RESEND_FROM_EMAIL || RESEND_FROM,
+      to: email,
+      subject: '🎉 Your BrainSAIT order is confirmed — My Account inside',
       html,
     }),
   });
@@ -2206,26 +2485,41 @@ async function sendTelegramWelcome(env: Env, opts: {
   fullName: string;
   appRef: string;
   githubUsername?: string;
+  lang?: 'ar' | 'en';
 }): Promise<void> {
   if (!env.TELEGRAM_BOT_TOKEN || !opts.telegramId) return;
+  const ar = opts.lang === 'ar';
   const trackUrl = `${BUILD_TRACK_URL}?ref=${encodeURIComponent(opts.appRef)}`;
   const repoName = `build-${opts.appRef.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 60)}`;
-  const lines = [
-    `🎉 <b>Welcome, ${escapeHtml(opts.fullName)}</b> — your BUILD seat is ACTIVE!`,
-    `✅ Payment confirmed · Super Partner`,
-    `🚀 Founder OS course: ${FOUNDER_OS_URL}`,
-    `🧠 Your 2nd Brain (BUILD): ${ULTIMATE_BRAIN_BUILD_URL}`,
-    opts.githubUsername ? `🐙 Your GitHub repo: ${GITHUB_PROFILE_URL}/${GITHUB_TEMPLATE_OWNER}/${repoName}` : '',
-    `📊 Track your 16 milestones: ${trackUrl}`,
-    env.TELEGRAM_COHORT_LINK ? `👥 Cohort: ${env.TELEGRAM_COHORT_LINK}` : '',
-    `📅 Adjust plan or discount: ${CALENDAR_URL}`,
-  ].filter(Boolean).join('\n');
+  const lines = ar
+    ? [
+        `🎉 <b>أهلاً بك، ${escapeHtml(opts.fullName)}</b> — مقعدك في BUILD مُفعّل الآن!`,
+        `✅ تم تأكيد الدفع · شريك Super`,
+        `🚀 دورة Founder OS: ${FOUNDER_OS_URL}`,
+        `🧠 دماغك الثاني (BUILD): ${ULTIMATE_BRAIN_BUILD_URL}`,
+        `🤖 بوت المتابعة: ${FORGE_BOT_URL}`,
+        opts.githubUsername ? `🐙 مستودعك على GitHub: ${GITHUB_PROFILE_URL}/${GITHUB_TEMPLATE_OWNER}/${repoName}` : '',
+        `📊 تابع محطّاتك الـ١٦: ${trackUrl}`,
+        env.TELEGRAM_COHORT_LINK ? `👥 المجموعة: ${env.TELEGRAM_COHORT_LINK}` : '',
+        `📅 تعديل الخطة أو الخصم: ${CALENDAR_URL}`,
+      ]
+    : [
+        `🎉 <b>Welcome, ${escapeHtml(opts.fullName)}</b> — your BUILD seat is ACTIVE!`,
+        `✅ Payment confirmed · Super Partner`,
+        `🚀 Founder OS course: ${FOUNDER_OS_URL}`,
+        `🧠 Your 2nd Brain (BUILD): ${ULTIMATE_BRAIN_BUILD_URL}`,
+        `🤖 Follow-up bot: ${FORGE_BOT_URL}`,
+        opts.githubUsername ? `🐙 Your GitHub repo: ${GITHUB_PROFILE_URL}/${GITHUB_TEMPLATE_OWNER}/${repoName}` : '',
+        `📊 Track your 16 milestones: ${trackUrl}`,
+        env.TELEGRAM_COHORT_LINK ? `👥 Cohort: ${env.TELEGRAM_COHORT_LINK}` : '',
+        `📅 Adjust plan or discount: ${CALENDAR_URL}`,
+      ];
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       chat_id: opts.telegramId,
-      text: lines,
+      text: lines.filter(Boolean).join('\n'),
       parse_mode: 'HTML',
       disable_web_page_preview: true,
     }),
@@ -2462,6 +2756,7 @@ function certificateHtml(name: string, appRef: string, certCode: string, issuedA
   const safeCode = escapeHtml(certCode);
   const date = new Date(issuedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
   const pdfUrl = `${BUILD_CERT_BASE}/certificate/${encodeURIComponent(appRef)}/pdf`;
+  const badgeUrl = `${BUILD_CERT_BASE}/badge/${encodeURIComponent(appRef)}`;
   return `<!DOCTYPE html>
 <html lang="en" dir="ltr">
 <head>
@@ -2507,7 +2802,10 @@ function certificateHtml(name: string, appRef: string, certCode: string, issuedA
     </div>
     <div class="stamp">The<br/>Second<br/>Brain<br/>Verified</div>
     <div class="foot"><b>BrainSAIT</b>Founder &amp; Incubation<br/>brainsait.org</div>
-    <div style="position:absolute;bottom:26px;left:50%;transform:translateX(-50%);"><a href="${pdfUrl}" style="display:inline-block;background:#131320;color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:12px;border-radius:999px;padding:9px 22px;">⬇ Download PDF</a></div>
+    <div style="position:absolute;bottom:26px;left:50%;transform:translateX(-50%);display:flex;gap:10px;">
+      <a href="${badgeUrl}" style="display:inline-block;background:linear-gradient(135deg,#c9a227,#e9c46a);color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:12px;border-radius:999px;padding:9px 22px;">🎖️ Badge</a>
+      <a href="${pdfUrl}" style="display:inline-block;background:#131320;color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:12px;border-radius:999px;padding:9px 22px;">⬇ Download PDF</a>
+    </div>
   </div>
 </body>
 </html>`;
@@ -2548,13 +2846,14 @@ async function checkAndIssueCertificate(
   env: Env,
   candidate: { id: string; properties: any; kv?: KvApplication },
   appRef: string,
-): Promise<{ ok: boolean; issued?: boolean; url?: string; code?: string; done?: number; total?: number }> {
+): Promise<{ ok: boolean; issued?: boolean; url?: string; badge?: string; code?: string; done?: number; total?: number }> {
   const name = candidate.kv
     ? candidate.kv.fullName
     : candidate.properties.Name?.title?.[0]?.plain_text || 'Builder';
   const email = candidate.kv
     ? candidate.kv.email
     : candidate.properties.Email?.email;
+  const lang: 'ar' | 'en' = candidate.properties?.Language?.select?.name === 'ar' ? 'ar' : 'en';
 
   const milestones = await milestonesForCandidate(env, candidate.id);
   const done = milestones.filter((m) => m.status === 'Completed').length;
@@ -2571,7 +2870,7 @@ async function checkAndIssueCertificate(
   if (!allDone) return { ok: true, issued: false, done, total };
 
   if (record?.issued) {
-    return { ok: true, issued: true, url: `${BUILD_CERT_BASE}/certificate/${encodeURIComponent(appRef)}`, code: record.code, done, total };
+    return { ok: true, issued: true, url: `${BUILD_CERT_BASE}/certificate/${encodeURIComponent(appRef)}`, badge: `${BUILD_CERT_BASE}/badge/${encodeURIComponent(appRef)}`, code: record.code, done, total };
   }
 
   const code = certificateRef();
@@ -2582,14 +2881,19 @@ async function checkAndIssueCertificate(
 
   try {
     // Permanent record — a certificate number must never rotate or re-issue.
-    await env.APPLICATIONS.put(CERT_KEY(appRef), JSON.stringify({ issued: true, code, issuedAt, trackName, email }));
+    await env.APPLICATIONS.put(CERT_KEY(appRef), JSON.stringify({ issued: true, code, issuedAt, trackName, email, name }));
+    // Code → application index (O(1) public verification by certificate number).
+    await env.APPLICATIONS.put(`certcode:${code}`, appRef);
+    // Immutable Open Badges 3.0 credential — issued once, stored forever.
+    await env.APPLICATIONS.put(`badge:${appRef}`, JSON.stringify(openBadgeCredential({ name, code, appRef, trackName, issuedAt }, BUILD_CERT_BASE)));
   } catch { /* ignore */ }
 
-  // Notify the builder with a luxury email: certificate + Second Brain + bot.
+  // Notify the builder with a luxury email: certificate + badge + Second Brain + bot.
   if (env.RESEND_API_KEY && email) {
     try {
       const certUrl = `${BUILD_CERT_BASE}/certificate/${encodeURIComponent(appRef)}`;
-      await sendCertificateEmail(env, email, name, code, certUrl, appRef);
+      const badgeUrl = `${BUILD_CERT_BASE}/badge/${encodeURIComponent(appRef)}`;
+      await sendCertificateEmail(env, email, name, code, certUrl, badgeUrl, appRef, lang);
     } catch { /* best-effort */ }
   }
 
@@ -2599,20 +2903,26 @@ async function checkAndIssueCertificate(
     data: { applicationId: appRef, email, name, certificateCode: code },
   });
 
-  return { ok: true, issued: true, url: `${BUILD_CERT_BASE}/certificate/${encodeURIComponent(appRef)}`, code, done, total };
+  return { ok: true, issued: true, url: `${BUILD_CERT_BASE}/certificate/${encodeURIComponent(appRef)}`, badge: `${BUILD_CERT_BASE}/badge/${encodeURIComponent(appRef)}`, code, done, total };
 }
 
-function luxuryEmailShell(title: string, bodyHtml: string, extraCss = ''): string {
+function luxuryEmailShell(title: string, bodyHtml: string, extraCss = '', lang: 'ar' | 'en' = 'en'): string {
+  const ar = lang === 'ar';
+  const dir = ar ? 'rtl' : 'ltr';
+  const htmlLang = ar ? 'ar' : 'en';
+  const bodyFont = ar
+    ? '"Segoe UI", Tahoma, "Noto Naskh Arabic", "Traditional Arabic", Arial, sans-serif'
+    : 'Georgia, "Times New Roman", serif';
   return `<!DOCTYPE html>
-<html lang="en" dir="ltr">
+<html lang="${htmlLang}" dir="${dir}">
 <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>${title}</title></head>
-<body style="margin:0;padding:0;background:#0d0d16;font-family:Georgia,'Times New Roman',serif;color:#222;">
+<body style="margin:0;padding:0;background:#0d0d16;font-family:${bodyFont};color:#222;">
   <div style="max-width:620px;margin:0 auto;padding:28px 16px;">
     <div style="background:linear-gradient(160deg,#131320 0%,#1e1e35 100%);border-radius:24px;padding:36px 32px;border:1px solid rgba(201,162,39,.35);box-shadow:0 24px 60px rgba(0,0,0,.45);">
       <div style="text-align:center;font-size:34px;line-height:1;">🧠</div>
       <div style="text-align:center;letter-spacing:.38em;text-transform:uppercase;font-size:11px;color:#c9a227;margin:10px 0 4px;font-family:Arial,sans-serif;">BrainSAIT</div>
-      <div style="text-align:center;letter-spacing:.24em;text-transform:uppercase;font-size:10px;color:#8f8faf;margin-bottom:24px;font-family:Arial,sans-serif;">Learn · Build · Solutions</div>
+      <div style="text-align:center;letter-spacing:.24em;text-transform:uppercase;font-size:10px;color:#8f8faf;margin-bottom:24px;font-family:Arial,sans-serif;">${ar ? 'تعلّم · ابنِ · حلول' : 'Learn · Build · Solutions'}</div>
       <div style="background:#fdfcf7;border-radius:18px;padding:28px 26px;line-height:1.75;font-size:15px;color:#333;">${bodyHtml}</div>
       <div style="text-align:center;color:#8f8faf;font-size:11px;margin-top:22px;font-family:Arial,sans-serif;">${extraCss}</div>
       <div style="text-align:center;color:#6a6a8a;font-size:11px;margin-top:8px;font-family:Arial,sans-serif;">BrainSAIT · store.brainsait.org · account.brainsait.org</div>
@@ -2627,34 +2937,68 @@ async function sendCertificateEmail(
   name: string,
   certCode: string,
   certUrl: string,
+  badgeUrl: string,
   appRef: string,
+  lang: 'ar' | 'en' = 'en',
 ): Promise<void> {
-  const body = `
-    <p style="margin:0 0 14px;font-size:17px;color:#131320;"><b>🎓 Congratulations, ${escapeHtml(name)}</b></p>
-    <p style="margin:0 0 16px;">You completed every milestone of the BUILD program. Your premium certificate has been issued — automatically, the moment your last milestone went <b>Completed</b>.</p>
-    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:18px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:14px 34px;">
-      <a href="${certUrl}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:15px;">View your certificate →</a>
-    </td></tr></table>
-    <p style="margin:0 0 12px;color:#666;font-size:13px;font-family:Arial,sans-serif;">Certificate № <b>${certCode}</b> · Application ${appRef}</p>
-    <hr style="border:none;border-top:1px solid #e5ddc4;margin:20px 0;" />
-    <p style="margin:0 0 10px;color:#131320;"><b>🎁 Your Second Brain</b> — proof you used your first one very well, and why you are here. Everything you built is organized there, alive and connected.</p>
-    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
-      <a href="${SECOND_BRAIN_URL}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Open your Second Brain 🧠</a>
-    </td></tr></table>
-    <p style="margin:0 0 10px;color:#131320;"><b>🧑‍💻 Keep shipping</b> — your GitHub repo and Notion board stay with you for good; milestones and progress remain tracked in your dashboard.</p>
-    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
-      <a href="${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Open your dashboard →</a>
-    </td></tr></table>
-    <p style="margin:18px 0 0;color:#666;font-size:13px;font-family:Arial,sans-serif;">You are now a BrainSAIT <b>partner</b>. Your builder profile lives at <a href="${ACCOUNT_URL}" style="color:#8a6d1f;">account.brainsait.org</a> — track progress, share your story, sell what you built.</p>
-  `;
-  const html = luxuryEmailShell(`Your BrainSAIT Completion Certificate — ${certCode}`, body);
+  const ar = lang === 'ar';
+  let body: string;
+  let subject: string;
+  if (ar) {
+    subject = `🎓 شهادة إتمام BrainSAIT — ${certCode}`;
+    body = `
+      <p style="margin:0 0 14px;font-size:17px;color:#131320;"><b>🎓 تهانينا، ${escapeHtml(name)}</b></p>
+      <p style="margin:0 0 16px;">أكملت كل محطّات برنامج BUILD. شهادتك المميّزة ووسامك الرقمي صُدرا تلقائياً، في اللحظة التي اكتملت فيها محطّتك الأخيرة.</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:18px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:14px 34px;">
+        <a href="${certUrl}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:15px;">عرض شهادتك ←</a>
+      </td></tr></table>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:14px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
+        <a href="${badgeUrl}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">🎖️ احصل على وسامك الرقمي ←</a>
+      </td></tr></table>
+      <p style="margin:0 0 12px;color:#666;font-size:13px;font-family:Arial,sans-serif;">الشهادة رقم <b>${certCode}</b> · الطلب ${appRef}</p>
+      <hr style="border:none;border-top:1px solid #e5ddc4;margin:20px 0;" />
+      <p style="margin:0 0 10px;color:#131320;"><b>🎁 دماغك الثاني</b> — دليل أنك استخدمت دماغك الأول كما ينبغي، وسبب وجودك هنا. كل ما بنيته منظّم هناك، حيّ ومترابط.</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
+        <a href="${SECOND_BRAIN_URL}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">افتح دماغك الثاني 🧠</a>
+      </td></tr></table>
+      <p style="margin:0 0 10px;color:#131320;"><b>🧑‍💻 واصل الإطلاق</b> — مستودع GitHub ولوحة Notion باقيان معك للأبد؛ المحطّات والتقدّم تبقى متابَعة في لوحتك.</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
+        <a href="${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">افتح لوحتك ←</a>
+      </td></tr></table>
+      <p style="margin:18px 0 0;color:#666;font-size:13px;font-family:Arial,sans-serif;">أنت الآن <b>شريك</b> في BrainSAIT. ملفّك كصانع على <a href="${ACCOUNT_URL}" style="color:#8a6d1f;">حسابي</a> — تابع تقدّمك، وشارك قصتك، وبِع ما بنيته.</p>
+    `;
+  } else {
+    subject = `🎓 Your BrainSAIT Completion Certificate — ${certCode}`;
+    body = `
+      <p style="margin:0 0 14px;font-size:17px;color:#131320;"><b>🎓 Congratulations, ${escapeHtml(name)}</b></p>
+      <p style="margin:0 0 16px;">You completed every milestone of the BUILD program. Your premium certificate and digital badge have been issued — automatically, the moment your last milestone went <b>Completed</b>.</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:18px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:14px 34px;">
+        <a href="${certUrl}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:15px;">View your certificate →</a>
+      </td></tr></table>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:14px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
+        <a href="${badgeUrl}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">🎖️ Claim your digital badge →</a>
+      </td></tr></table>
+      <p style="margin:0 0 12px;color:#666;font-size:13px;font-family:Arial,sans-serif;">Certificate № <b>${certCode}</b> · Application ${appRef}</p>
+      <hr style="border:none;border-top:1px solid #e5ddc4;margin:20px 0;" />
+      <p style="margin:0 0 10px;color:#131320;"><b>🎁 Your Second Brain</b> — proof you used your first one very well, and why you are here. Everything you built is organized there, alive and connected.</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
+        <a href="${SECOND_BRAIN_URL}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Open your Second Brain 🧠</a>
+      </td></tr></table>
+      <p style="margin:0 0 10px;color:#131320;"><b>🧑‍💻 Keep shipping</b> — your GitHub repo and Notion board stay with you for good; milestones and progress remain tracked in your dashboard.</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
+        <a href="${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Open your dashboard →</a>
+      </td></tr></table>
+      <p style="margin:18px 0 0;color:#666;font-size:13px;font-family:Arial,sans-serif;">You are now a BrainSAIT <b>partner</b>. Your builder profile lives at <a href="${ACCOUNT_URL}" style="color:#8a6d1f;">My Account</a> — track progress, share your story, sell what you built.</p>
+    `;
+  }
+  const html = luxuryEmailShell(subject, body, '', lang);
   await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       from: env.RESEND_FROM_EMAIL || RESEND_FROM,
       to: email,
-      subject: `🎓 Your BrainSAIT Completion Certificate — ${certCode}`,
+      subject,
       html,
     }),
   });
@@ -2858,6 +3202,138 @@ async function certificateInfoForRef(env: Env, applicationRef: string) {
   };
 }
 
+// ─── Open Badges 3.0 digital badge ──────────────────────────────────────────
+// /badge/:ref                    → shareable badge page (Credly-style)
+// /badge/:ref/image.svg          → luxury SVG badge image
+// /badge/:ref/credential.json    → OB 3.0 verifiable credential (JSON-LD)
+async function handleBadge(request: Request, env: Env, path: string): Promise<Response> {
+  const origin = request.headers.get('origin');
+  let ref = decodeURIComponent(path);
+  let kind: 'page' | 'image' | 'credential' = 'page';
+  if (ref.endsWith('/image.svg')) {
+    kind = 'image';
+    ref = ref.slice(0, -'/image.svg'.length);
+  } else if (ref.endsWith('/credential.json')) {
+    kind = 'credential';
+    ref = ref.slice(0, -'/credential.json'.length);
+  }
+  if (!ref || ref.length < 8) {
+    return jsonResponse({ ok: false, error: 'Invalid application ref' }, 400, origin);
+  }
+  const info = await certificateInfoForRef(env, ref);
+  if (!info) return jsonResponse({ ok: false, error: 'Application not found' }, 404, origin);
+  if (!info.issued) {
+    return jsonResponse({ ok: false, error: 'Badge not issued yet — complete all milestones' }, 409, origin);
+  }
+  const data: BadgeData = { name: info.name, code: info.code, appRef: ref, trackName: info.trackName, issuedAt: info.issuedAt };
+  if (kind === 'image') {
+    return new Response(badgeSvg(data), {
+      status: 200,
+      headers: { 'Content-Type': 'image/svg+xml; charset=utf-8', ...corsHeaders(origin), 'Cache-Control': 'public, max-age=300' },
+    });
+  }
+  if (kind === 'credential') {
+    // Prefer the immutable stored credential (issued once); fall back to on-demand.
+    let stored: Record<string, unknown> | null = null;
+    try { stored = await env.APPLICATIONS.get(`badge:${ref}`, 'json'); } catch { /* ignore */ }
+    return jsonResponse(stored || openBadgeCredential(data, BUILD_CERT_BASE), 200, origin);
+  }
+  return new Response(badgePageHtml(data, BUILD_CERT_BASE), {
+    status: 200,
+    headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders(origin), 'Cache-Control': 'public, max-age=300' },
+  });
+}
+
+// ─── Public verification — by certificate number or application ref ─────────
+// GET /verify/:codeOrRef → JSON { verified, code, name, trackName, issuedAt, urls }
+async function handleVerify(request: Request, env: Env, codeOrRef: string): Promise<Response> {
+  const origin = request.headers.get('origin');
+  const q = (codeOrRef || '').trim();
+  if (!q) return jsonResponse({ ok: false, verified: false, error: 'Missing certificate number or ref' }, 400, origin);
+
+  let ref = q;
+  let rec: any = null;
+  try { rec = await env.APPLICATIONS.get(CERT_KEY(q), 'json'); } catch { /* ignore */ }
+  if (!rec?.issued) {
+    // Not a ref — try the certificate-number index.
+    try {
+      const byCode = await env.APPLICATIONS.get(`certcode:${q}`);
+      if (byCode) {
+        ref = byCode;
+        rec = await env.APPLICATIONS.get(CERT_KEY(byCode), 'json');
+      }
+    } catch { /* ignore */ }
+  }
+
+  if (!rec?.issued) {
+    return jsonResponse({ ok: true, verified: false, error: 'Credential not found' }, 404, origin);
+  }
+
+  return jsonResponse({
+    ok: true,
+    verified: true,
+    code: rec.code,
+    name: rec.name || null,
+    trackName: rec.trackName || null,
+    issuedAt: rec.issuedAt,
+    certificateUrl: `${BUILD_CERT_BASE}/certificate/${encodeURIComponent(ref)}`,
+    badgeUrl: `${BUILD_CERT_BASE}/badge/${encodeURIComponent(ref)}`,
+  }, 200, origin);
+}
+
+// Admin preview page — renders the badge at multiple sizes and lets you tweak
+// the name/track/code without issuing anything.
+function previewBadgeHtml(name: string, trackName: string, code: string, svg: string, token: string): string {
+  const dataUri = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+  const s = (v: string) => escapeHtml(v);
+  const t = encodeURIComponent(token);
+  return `<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Badge preview — ${s(name)}</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; background: #0b1022; color: #eef1fb; margin: 0; padding: 2rem; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  h1 { color: #e9c46a; font-size: 1.3rem; margin-bottom: .5rem; }
+  p.sub { color: #8b93b5; font-size: .85rem; margin-bottom: 1.4rem; }
+  form { display: flex; gap: .6rem; flex-wrap: wrap; margin-bottom: 2rem; }
+  input[type=text] { flex: 1; min-width: 160px; padding: .65rem .9rem; border-radius: 12px; border: 1px solid rgba(255,255,255,.15); background: rgba(255,255,255,.05); color: #eef1fb; font-size: .9rem; }
+  button { padding: .65rem 1.3rem; border-radius: 12px; border: none; background: linear-gradient(135deg,#c9a227,#e9c46a); color: #131320; font-weight: 700; cursor: pointer; }
+  .sizes { display: flex; gap: 1rem; align-items: flex-end; flex-wrap: wrap; }
+  .size { text-align: center; }
+  .size span { display: block; color: #8b93b5; font-size: .75rem; margin-top: .4rem; }
+  .links { margin-top: 2rem; display: flex; gap: .8rem; flex-wrap: wrap; }
+  .links a { color: #e9c46a; font-size: .85rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎖️ BUILD Badge — Preview</h1>
+  <p class="sub">No credential is issued here — this only renders the badge design so you can eyeball it before a real graduation fires.</p>
+  <form method="GET" action="/admin/preview-badge">
+    <input type="hidden" name="token" value="${t}" />
+    <input type="text" name="name" value="${s(name)}" placeholder="Full name" />
+    <input type="text" name="track" value="${s(trackName)}" placeholder="Track" />
+    <input type="text" name="code" value="${s(code)}" placeholder="Certificate №" />
+    <button type="submit">Render</button>
+  </form>
+  <div class="sizes">
+    <div class="size"><img src="${dataUri}" width="120" height="120" alt="badge 120" /><span>120px</span></div>
+    <div class="size"><img src="${dataUri}" width="240" height="240" alt="badge 240" /><span>240px</span></div>
+    <div class="size"><img src="${dataUri}" width="420" height="420" alt="badge 420" /><span>420px</span></div>
+  </div>
+  <div class="links">
+    <a href="/admin/preview-badge?format=svg&token=${t}&name=${encodeURIComponent(name)}&track=${encodeURIComponent(trackName)}&code=${encodeURIComponent(code)}">Raw SVG</a>
+    <a href="/admin/preview-badge?format=credential&token=${t}&name=${encodeURIComponent(name)}&track=${encodeURIComponent(trackName)}&code=${encodeURIComponent(code)}">OB 3.0 credential JSON</a>
+  </div>
+</div>
+</body>
+</html>`;
+}
+
 async function handleCertificatePdf(request: Request, env: Env, applicationRef: string): Promise<Response> {
   const origin = request.headers.get('origin');
   if (!applicationRef || applicationRef.length < 8) {
@@ -2968,8 +3444,8 @@ async function handleBotDay(request: Request, env: Env): Promise<Response> {
   if (!candidate) {
     return jsonResponse({ ok: false, error: 'No application linked to this Telegram account. Use /link <application_ref> first.' }, 404, origin);
   }
-  let completedTask: string | null;
-  let progress: ProgressInfo;
+  let completedTask: string | null = null;
+  let progress: ProgressInfo = { percent: 0, doneTasks: 0, totalTasks: 0, badges: [], tasks: [], milestones: [], nextTask: null };
   if (candidate.kv) {
     const app = candidate.kv;
     const open = app.tasks.find((t) => t.status !== 'Done');
@@ -2980,8 +3456,17 @@ async function handleBotDay(request: Request, env: Env): Promise<Response> {
     }
     progress = kvProgress(app);
   } else {
-    completedTask = await completeNextTask(env, candidate.id);
-    progress = await updateProgressOnApplication(env, candidate.id);
+    try {
+      completedTask = await completeNextTask(env, candidate.id);
+    } catch (e) {
+      console.error(`handleBotDay completeNextTask failed: ${e}`);
+    }
+    try {
+      progress = await updateProgressOnApplication(env, candidate.id);
+    } catch (e) {
+      console.error(`handleBotDay updateProgress failed: ${e}`);
+      // Keep the zeroed progress view so the bot still answers gracefully.
+    }
     // All tasks done → capstone auto-completed → certificate may now be issuable.
     try {
       const appRef = candidate.properties?.['Payment Reference']?.rich_text?.[0]?.plain_text;
@@ -3509,6 +3994,197 @@ async function syncShopifyCustomer(env: Env, input: CustomerSyncInput, sendEmail
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * CUSTOMER IDENTITY — post-payment onboarding shared by LEARN and BUILD.
+ * Issues a permanent BrainSAIT OID via brainsait-notify's proxy in front of
+ * the OID registry, mints a long-lived single-use "claim" token (used by
+ * the Shopify Order Status Page redirect and the welcome email — both need
+ * to survive longer than a 10-minute OTP), and a 60-day session token that
+ * both the claim and a manually-requested OTP exchange into. All KV-backed
+ * on the same APPLICATIONS namespace everything else in this file uses.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+interface CustomerProfile {
+  email: string;
+  name: string;
+  oid?: string;
+  phone?: string;
+  buildRef?: string;               // set only for BUILD customers
+  products?: { slug: string; name: string; url: string }[]; // set only for LEARN customers
+}
+
+/** Allocate a permanent BrainSAIT OID for a customer via the brainsait-notify
+ * proxy (the OID registry itself is localhost-only on the home server and
+ * unreachable from this Worker — notify.brainsait.de is the public, TLS'd,
+ * authenticated front door to it). Best-effort: returns undefined on any
+ * failure so the rest of onboarding is never blocked on this.
+ */
+async function issueOid(env: Env, input: { email: string; name: string; role: string }): Promise<string | undefined> {
+  if (!env.NOTIFY_API_KEY) return undefined;
+  try {
+    const res = await fetch(`${NOTIFY_BASE}/oid/issue`, {
+      method: 'POST',
+      headers: { 'X-Notify-Key': env.NOTIFY_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: input.email, name: input.name, role: input.role, access_level: 'standard' }),
+    });
+    if (!res.ok) { console.error(`issueOid: HTTP ${res.status}`); return undefined; }
+    const data = (await res.json()) as { ok?: boolean; oid?: string };
+    return data.ok ? data.oid : undefined;
+  } catch (e) { console.error(`issueOid failed: ${e}`); return undefined; }
+}
+
+/** Request a 6-digit email OTP via brainsait-notify — used only for a
+ * customer manually returning to /account later and re-proving identity.
+ * The initial post-payment login uses the longer-lived claim token below.
+ */
+async function notifyOtpRequest(env: Env, email: string): Promise<{ ok: boolean; error?: string }> {
+  if (!env.NOTIFY_API_KEY) return { ok: false, error: 'NOTIFY_API_KEY not configured' };
+  try {
+    const res = await fetch(`${NOTIFY_BASE}/otp/request`, {
+      method: 'POST',
+      headers: { 'X-Notify-Key': env.NOTIFY_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: email, channel: 'email', brand: 'BrainSAIT' }),
+    });
+    const data = (await res.json()) as any;
+    return res.ok && data.ok ? { ok: true } : { ok: false, error: data.detail || `HTTP ${res.status}` };
+  } catch (e) { return { ok: false, error: String(e) }; }
+}
+
+async function notifyOtpVerify(env: Env, email: string, code: string): Promise<boolean> {
+  if (!env.NOTIFY_API_KEY) return false;
+  try {
+    const res = await fetch(`${NOTIFY_BASE}/otp/verify`, {
+      method: 'POST',
+      headers: { 'X-Notify-Key': env.NOTIFY_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: email, code, channel: 'email' }),
+    });
+    const data = (await res.json()) as any;
+    return !!(res.ok && data.ok && data.verified);
+  } catch { return false; }
+}
+
+const CLAIM_TTL_SECONDS = 7 * 24 * 60 * 60;   // 7 days — first post-payment login
+const SESSION_TTL_SECONDS = 60 * 24 * 60 * 60; // 60 days — durable cross-device login
+
+/** Mint a single-use claim token for `profile`, and index it by order id so
+ * the Shopify redirect script's poll (`/customer/claim-by-order`) can find
+ * it without holding the token itself.
+ */
+async function mintClaimToken(env: Env, profile: CustomerProfile, orderKey?: string): Promise<string> {
+  const token = crypto.randomUUID();
+  await env.APPLICATIONS.put(`claim:${token}`, JSON.stringify(profile), { expirationTtl: CLAIM_TTL_SECONDS });
+  if (orderKey) {
+    await env.APPLICATIONS.put(`claim-by-order:${orderKey}`, token, { expirationTtl: CLAIM_TTL_SECONDS });
+  }
+  return token;
+}
+
+async function mintSessionToken(env: Env, profile: CustomerProfile): Promise<string> {
+  const token = crypto.randomUUID();
+  await env.APPLICATIONS.put(`session:${token}`, JSON.stringify(profile), { expirationTtl: SESSION_TTL_SECONDS });
+  return token;
+}
+
+async function resolveSessionToken(env: Env, token: string): Promise<CustomerProfile | null> {
+  if (!token) return null;
+  return (await env.APPLICATIONS.get(`session:${token}`, 'json')) as CustomerProfile | null;
+}
+
+/** Single-use: exchange a claim token for a session token, deleting the
+ * claim immediately so it can never be replayed.
+ */
+async function consumeClaimToken(env: Env, token: string): Promise<CustomerProfile | null> {
+  const profile = (await env.APPLICATIONS.get(`claim:${token}`, 'json')) as CustomerProfile | null;
+  if (!profile) return null;
+  await env.APPLICATIONS.delete(`claim:${token}`);
+  return profile;
+}
+
+const MASTER_CONTACTS_BASE = 'appLZE2iVPr417DVN';
+const MASTER_CONTACTS_TABLE = 'tblDWgwwJN5K3wU4s';
+
+async function findMasterContactByEmail(env: Env, email: string): Promise<{ id: string; fields: Record<string, unknown> } | null> {
+  if (!env.AIRTABLE_API_KEY) return null;
+  try {
+    const data = await airtableRequest(env, 'GET',
+      `/${MASTER_CONTACTS_BASE}/${MASTER_CONTACTS_TABLE}?filterByFormula=${encodeURIComponent(`LOWER({Email})="${email.toLowerCase()}"`)}&maxRecords=1`);
+    const rec = data?.records?.[0];
+    return rec ? { id: rec.id, fields: rec.fields } : null;
+  } catch { return null; }
+}
+
+/** Upsert a customer into the master "BrainSAIT Operating System" Contacts
+ * table — the same table every other purchase type (PayPal, legacy Shopify,
+ * OID sales) already converges into via the n8n fanout workflow. Reuses its
+ * existing field vocabulary exactly rather than inventing new columns.
+ */
+async function syncMasterContact(env: Env, input: {
+  name: string; email: string; phone?: string; tags: string[]; sourceSystem: string; sourceId: string; notes?: string;
+}): Promise<{ ok: boolean; recordId?: string; action?: string; error?: string }> {
+  if (!env.AIRTABLE_API_KEY) return { ok: false, error: 'airtable not configured' };
+  const existing = await findMasterContactByEmail(env, input.email);
+  const priorTags = existing ? String(existing.fields['Tags'] || '').split(',').map((s) => s.trim()).filter(Boolean) : [];
+  const mergedTags = Array.from(new Set([...priorTags, ...input.tags])).join(', ');
+  const fields: Record<string, unknown> = {
+    'Name': input.name || 'Customer',
+    'Email': input.email,
+    'Phone': input.phone || undefined,
+    'Tags': mergedTags,
+    'Source System': input.sourceSystem,
+    'Source ID': input.sourceId,
+    'Notes': input.notes || undefined,
+  };
+  if (!existing) fields['First Seen'] = new Date().toISOString();
+  const clean: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(fields)) if (v !== undefined) clean[k] = v;
+  try {
+    if (existing) {
+      const res = await airtableRequest(env, 'PATCH', `/${MASTER_CONTACTS_BASE}/${MASTER_CONTACTS_TABLE}`, { records: [{ id: existing.id, fields: clean }] });
+      if (res?.records?.[0]) return { ok: true, action: 'updated', recordId: existing.id };
+      return { ok: false, error: JSON.stringify(res).slice(0, 300) };
+    }
+    const res = await airtableRequest(env, 'POST', `/${MASTER_CONTACTS_BASE}/${MASTER_CONTACTS_TABLE}`, { records: [{ fields: clean }] });
+    if (res?.records?.[0]) return { ok: true, action: 'created', recordId: res.records[0].id };
+    return { ok: false, error: JSON.stringify(res).slice(0, 300) };
+  } catch (err) { return { ok: false, error: String(err) }; }
+}
+
+interface ResolvedOrderProducts {
+  learnProducts: { slug: string; name: string; url: string }[];
+  solutionsOnly: boolean; // every resolvable line item was SOLUTIONS-type
+  anyResolved: boolean;
+}
+
+/** Classify a paid order's line items by fetching each product from the
+ * Shopify Admin API (orders/paid webhooks don't carry product_type or tags
+ * on line items) — reads product_type (LEARN/SOLUTIONS/BUILD, set by
+ * scripts/mirror-catalog-to-shopify.py) and the `source:<slug>` tag that
+ * same script stamps onto every product it manages, so the exact catalog
+ * slug comes straight from the live product, not a duplicated static map.
+ */
+async function resolveOrderProducts(env: Env, order: any): Promise<ResolvedOrderProducts> {
+  const lineItems = (order.line_items || []) as any[];
+  const learnProducts: { slug: string; name: string; url: string }[] = [];
+  let resolvedCount = 0;
+  let solutionsCount = 0;
+  for (const li of lineItems) {
+    if (!li.product_id) continue;
+    try {
+      const res = await shopifyRest(env, 'GET', `products/${li.product_id}.json?fields=product_type,tags,title,handle`);
+      const p = res?.data?.product;
+      if (!p) continue;
+      resolvedCount += 1;
+      const type = String(p.product_type || '').toUpperCase();
+      if (type === 'SOLUTIONS') { solutionsCount += 1; continue; }
+      const tags = String(p.tags || '').split(',').map((t: string) => t.trim());
+      const sourceTag = tags.find((t: string) => t.startsWith('source:'));
+      const slug = sourceTag ? sourceTag.slice('source:'.length) : p.handle;
+      learnProducts.push({ slug, name: p.title || li.title, url: `https://fadil369.github.io/products/${slug}` });
+    } catch { /* best-effort — an unresolved item is simply omitted, not fatal */ }
+  }
+  return { learnProducts, solutionsOnly: resolvedCount > 0 && solutionsCount === resolvedCount, anyResolved: resolvedCount > 0 };
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  * SUPER PARTNER SUITE — BrainSAIT OS expanded Admin API capabilities.
  *
  * These best-effort helpers turn a paid BUILD candidate into a fully
@@ -3957,6 +4633,116 @@ async function handleCustomerSync(request: Request, env: Env): Promise<Response>
   }
 }
 
+/** Manual re-login: request a 6-digit OTP for a customer returning to
+ * /account from a new device (the initial post-payment login instead uses
+ * the longer-lived claim token minted at webhook time — see mintClaimToken).
+ * Rate-limited per IP, mirrors handleCustomerSync's convention.
+ */
+async function handleCustomerOtpRequest(request: Request, env: Env, origin: string | null): Promise<Response> {
+  try {
+    const body = (await request.json()) as { email?: string };
+    const email = String(body.email || '').toLowerCase().trim();
+    if (!validateEmail(email)) return jsonResponse({ ok: false, error: 'Invalid email address' }, 400, origin);
+    const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+    const limitKey = `otp-req:${ip}`;
+    const count = Number((await env.APPLICATIONS.get(limitKey)) || 0);
+    if (count >= 5) return jsonResponse({ ok: false, error: 'Rate limited — try again later' }, 429, origin);
+    await env.APPLICATIONS.put(limitKey, String(count + 1), { expirationTtl: 3600 });
+    const result = await notifyOtpRequest(env, email);
+    return jsonResponse(result, result.ok ? 200 : 502, origin);
+  } catch (e) {
+    return jsonResponse({ ok: false, error: String(e) }, 500, origin);
+  }
+}
+
+/** Verify the OTP and, on success, mint a durable 60-day session token.
+ * Looks up any existing profile in D1 (from a prior purchase) so a
+ * returning customer's OID/products/buildRef come back intact; falls back
+ * to a bare {email} profile if this is the first time we've seen them.
+ */
+async function handleCustomerOtpVerify(request: Request, env: Env, origin: string | null): Promise<Response> {
+  try {
+    const body = (await request.json()) as { email?: string; code?: string };
+    const email = String(body.email || '').toLowerCase().trim();
+    const code = String(body.code || '').trim();
+    if (!validateEmail(email) || !code) return jsonResponse({ ok: false, error: 'Missing email or code' }, 400, origin);
+    const verified = await notifyOtpVerify(env, email, code);
+    if (!verified) return jsonResponse({ ok: false, error: 'Invalid or expired code' }, 401, origin);
+    const student = await d1GetStudent(env, email);
+    const profile: CustomerProfile = {
+      email,
+      name: String(student?.full_name || email.split('@')[0]),
+      oid: (student?.oid as string) || undefined,
+    };
+    const token = await mintSessionToken(env, profile);
+    return jsonResponse({ ok: true, token, profile }, 200, origin);
+  } catch (e) {
+    return jsonResponse({ ok: false, error: String(e) }, 500, origin);
+  }
+}
+
+/** Single-use exchange of a claim token (from the redirect or welcome email)
+ * for a durable session token — the primary first-login path.
+ */
+async function handleCustomerClaim(request: Request, env: Env, origin: string | null): Promise<Response> {
+  try {
+    const body = (await request.json()) as { token?: string };
+    const claimed = body.token ? await consumeClaimToken(env, body.token) : null;
+    if (!claimed) return jsonResponse({ ok: false, error: 'Invalid or expired claim token' }, 401, origin);
+    const token = await mintSessionToken(env, claimed);
+    return jsonResponse({ ok: true, token, profile: claimed }, 200, origin);
+  } catch (e) {
+    return jsonResponse({ ok: false, error: String(e) }, 500, origin);
+  }
+}
+
+/** Polled by the Shopify Order Status Page's redirect script — returns the
+ * claim token once this order's webhook has finished processing, so the
+ * browser can be sent to /account without ever holding a secret in a
+ * Liquid-templated URL (order id + email are not secrets).
+ */
+async function handleCustomerClaimByOrder(url: URL, env: Env, origin: string | null): Promise<Response> {
+  const orderId = url.searchParams.get('orderId') || '';
+  if (!orderId) return jsonResponse({ ok: false, error: 'Missing orderId' }, 400, origin);
+  // order ids arrive as either the numeric id or the admin_graphql_api_id —
+  // try both forms since the webhook indexes by admin_graphql_api_id first.
+  const candidates = [orderId, `gid://shopify/Order/${orderId}`];
+  for (const key of candidates) {
+    const token = await env.APPLICATIONS.get(`claim-by-order:${key}`);
+    if (token) return jsonResponse({ ok: true, token, pending: false }, 200, origin);
+  }
+  return jsonResponse({ ok: true, pending: true }, 200, origin);
+}
+
+/** Resolve a session token to its profile — Account.tsx's primary identity
+ * source going forward.
+ */
+async function handleCustomerMe(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const token = request.headers.get('x-token') || '';
+  if (!token) return jsonResponse({ ok: false, error: 'Missing X-Token' }, 401, origin);
+  const profile = await resolveSessionToken(env, token);
+  if (!profile) return jsonResponse({ ok: false, error: 'Invalid or expired session' }, 401, origin);
+  return jsonResponse({ ok: true, profile }, 200, origin);
+}
+
+/** Links a Shopify Customer Account API identity (from the new native OAuth
+ * flow on fadil369.github.io) to this student's existing D1 row, keyed by
+ * the email already tied to their OTP/claim session. Best-effort caller. */
+async function handleCustomerLinkShopify(request: Request, env: Env, origin: string | null): Promise<Response> {
+  const token = request.headers.get('x-token') || '';
+  if (!token) return jsonResponse({ ok: false, error: 'Missing X-Token' }, 401, origin);
+  const profile = await resolveSessionToken(env, token);
+  if (!profile) return jsonResponse({ ok: false, error: 'Invalid or expired session' }, 401, origin);
+
+  const body = (await request.json().catch(() => ({}))) as { shopifyCustomerGid?: string };
+  if (!body.shopifyCustomerGid || !/^gid:\/\/shopify\/Customer\/\d+$/.test(body.shopifyCustomerGid)) {
+    return jsonResponse({ ok: false, error: 'Invalid shopifyCustomerGid' }, 400, origin);
+  }
+
+  await d1UpsertStudent(env, profile.email, { shopify_customer_gid: body.shopifyCustomerGid });
+  return jsonResponse({ ok: true }, 200, origin);
+}
+
 async function handleApply(request: Request, env: Env): Promise<Response> {
   const origin = request.headers.get('origin');
 
@@ -4122,7 +4908,7 @@ async function handleApply(request: Request, env: Env): Promise<Response> {
 
     let checkoutUrl: string | undefined;
     const planName = (payload.plan === 'flex' || payload.plan === 'split' || payload.plan === 'quarter') ? payload.plan : 'full';
-    const installmentPlan = buildInstallmentSchedule(appRef, payload.email, payload.fullName, payload.phone, planName, pricing.finalPrice);
+    const installmentPlan = buildInstallmentSchedule(appRef, payload.email, payload.fullName, payload.phone, planName, pricing.finalPrice, new Date(), payload.lang === 'ar' ? 'ar' : 'en');
     await saveInstallmentPlan(env, installmentPlan);
     // Broadcast the plan creation so the ecosystem knows (Notion, Airtable,
     // hub/Telegram/SMS/n8n, KB). Skip for full-payment (single 9,630).
@@ -4131,7 +4917,10 @@ async function handleApply(request: Request, env: Env): Promise<Response> {
     }
 
     if (pricing.finalPrice > 0) {
-      const variantId = SHOPIFY_VARIANTS[pricing.eligibilityId] || SHOPIFY_VARIANTS.standard;
+      // Route the FIRST payment to the plan-specific product page so the cart
+      // charges the exact installment amount (not the full 9,630 ticket).
+      const variantId = INSTALLMENT_VARIANTS[planName] || INSTALLMENT_VARIANTS.full;
+      const firstAmount = installmentPlan.installments[0].amount;
       const shop = env.SHOPIFY_STORE_DOMAIN || 'store.brainsait.org';
       const params = new URLSearchParams();
       params.set('id', variantId);
@@ -4139,6 +4928,8 @@ async function handleApply(request: Request, env: Env): Promise<Response> {
       params.set('properties[eligibility_tier]', pricing.eligibilityId);
       params.set('properties[discount_percent]', String(pricing.discount));
       params.set('properties[final_price]', String(pricing.finalPrice));
+      params.set('properties[installment_amount]', String(firstAmount));
+      params.set('properties[installment_plan]', planName);
       params.set('properties[application_ref]', appRef);
       params.set('properties[applicant_email]', payload.email);
       params.set('properties[installment_no]', '1');
@@ -4289,11 +5080,39 @@ export default {
     }
 
     if (url.pathname === '/apply' && request.method === 'POST') {
+      const rl = await rateLimit(env, request, 'apply', 10, 3600);
+      if (!rl.ok) return jsonResponse({ ok: false, error: 'Too many requests. Please try again later.' }, 429, origin);
       return handleApply(request, env);
     }
 
     if (url.pathname === '/customer/sync' && request.method === 'POST') {
       return handleCustomerSync(request, env);
+    }
+
+    if (url.pathname === '/customer/otp/request' && request.method === 'POST') {
+      const rl = await rateLimit(env, request, 'otp', 5, 900);
+      if (!rl.ok) return jsonResponse({ ok: false, error: 'Too many code requests. Wait a few minutes.' }, 429, origin);
+      return handleCustomerOtpRequest(request, env, origin);
+    }
+
+    if (url.pathname === '/customer/otp/verify' && request.method === 'POST') {
+      return handleCustomerOtpVerify(request, env, origin);
+    }
+
+    if (url.pathname === '/customer/claim' && request.method === 'POST') {
+      return handleCustomerClaim(request, env, origin);
+    }
+
+    if (url.pathname === '/customer/claim-by-order' && request.method === 'GET') {
+      return handleCustomerClaimByOrder(url, env, origin);
+    }
+
+    if (url.pathname === '/customer/me' && request.method === 'GET') {
+      return handleCustomerMe(request, env, origin);
+    }
+
+    if (url.pathname === '/customer/link-shopify' && request.method === 'POST') {
+      return handleCustomerLinkShopify(request, env, origin);
     }
 
     if (url.pathname === '/webhook/shopify' && request.method === 'POST') {
@@ -4312,6 +5131,29 @@ export default {
 
     if (url.pathname.startsWith('/certificate/') && request.method === 'GET') {
       return handleCertificate(request, env, decodeURIComponent(url.pathname.slice('/certificate/'.length)));
+    }
+
+    // Open Badges 3.0 — digital badge (page / image / credential JSON).
+    if (url.pathname === '/badge-image.svg' && request.method === 'GET') {
+      return new Response(badgeClassImageSvg(), {
+        status: 200,
+        headers: { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600', ...corsHeaders(origin) },
+      });
+    }
+
+    if (url.pathname.startsWith('/badge-class/') && request.method === 'GET') {
+      const slug = decodeURIComponent(url.pathname.slice('/badge-class/'.length));
+      const track = slug.split('-').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+      return jsonResponse(badgeClassForTrack(track, BUILD_CERT_BASE), 200, origin);
+    }
+
+    if (url.pathname.startsWith('/badge/') && request.method === 'GET') {
+      return handleBadge(request, env, url.pathname.slice('/badge/'.length));
+    }
+
+    // Public verification — by certificate number or application ref.
+    if (url.pathname.startsWith('/verify/') && request.method === 'GET') {
+      return handleVerify(request, env, decodeURIComponent(url.pathname.slice('/verify/'.length)));
     }
 
     if (url.pathname.startsWith('/progress/') && request.method === 'GET') {
@@ -4401,6 +5243,61 @@ export default {
       }, 200, origin);
     }
 
+    // Late GitHub collaborator invite — for applicants whose repo was created
+    // before a GitHub username was supplied (or whose username changed).
+    //   POST /admin/invite-github/<ref>  { "githubUsername": "octocat" }
+    if (url.pathname.startsWith('/admin/invite-github/') && request.method === 'POST') {
+      const token = request.headers.get('x-admin-token') || '';
+      if (!env.ADMIN_TOKEN || token !== env.ADMIN_TOKEN) {
+        return jsonResponse({ ok: false, error: 'unauthorized' }, 401, origin);
+      }
+      const ref = decodeURIComponent(url.pathname.slice('/admin/invite-github/'.length));
+      const body = (await request.json().catch(() => ({}))) as { githubUsername?: string };
+      const githubUsername = body.githubUsername?.trim();
+      if (!ref || !githubUsername) {
+        return jsonResponse({ ok: false, error: 'Missing ref or githubUsername' }, 400, origin);
+      }
+      try {
+        await provisionGitHubAccess(env, ref, githubUsername);
+        const rec = (await env.APPLICATIONS.get(`github-provisioned:${refKey(ref)}`, 'json')) as { repoUrl?: string; githubUsername?: string } | null;
+        return jsonResponse({
+          ok: true,
+          ref,
+          githubUsername,
+          repoUrl: rec?.repoUrl || null,
+          provisionedGithubUsername: rec?.githubUsername || null,
+        }, 200, origin);
+      } catch (err) {
+        return jsonResponse({ ok: false, error: String(err) }, 500, origin);
+      }
+    }
+
+    // Preview the BUILD badge design without issuing anything.
+    //   GET /admin/preview-badge?name=…&track=…&code=…&format=page|svg|credential
+    // Auth via `x-admin-token` header or `?token=` (browser-friendly, harmless design preview).
+    if (url.pathname === '/admin/preview-badge' && request.method === 'GET') {
+      const token = (request.headers.get('x-admin-token') || url.searchParams.get('token') || '').trim();
+      if (!env.ADMIN_TOKEN || token !== env.ADMIN_TOKEN.trim()) {
+        return jsonResponse({ ok: false, error: 'unauthorized' }, 401, origin);
+      }
+      const name = (url.searchParams.get('name') || 'Your Name Here').trim();
+      const trackName = (url.searchParams.get('track') || 'Founder Accelerator').trim();
+      const code = (url.searchParams.get('code') || 'BS-CERT-2026-PREVIEW').trim();
+      const issuedAt = url.searchParams.get('date') || new Date().toISOString();
+      const format = url.searchParams.get('format') || 'page';
+      const data: BadgeData = { name, code, appRef: 'BS-APP-PREVIEW', trackName, issuedAt };
+      if (format === 'svg') {
+        return new Response(badgeSvg(data), { status: 200, headers: { 'Content-Type': 'image/svg+xml; charset=utf-8', ...corsHeaders(origin) } });
+      }
+      if (format === 'credential') {
+        return jsonResponse(openBadgeCredential(data, BUILD_CERT_BASE), 200, origin);
+      }
+      return new Response(previewBadgeHtml(name, trackName, code, badgeSvg(data), token), {
+        status: 200,
+        headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders(origin), 'Cache-Control': 'no-store' },
+      });
+    }
+
     // EVENT ROUTER — other systems (Telegram bot, simulator, portal) POST here
     // to update the central student state in D1 and trigger async fan‑out.
     if (url.pathname.startsWith('/events/') && request.method === 'POST') {
@@ -4416,6 +5313,8 @@ export default {
     // PIXEL EVENT SINK — public endpoint that the Shopify web pixel forwards
     // attribution events to (page_viewed, product_viewed, purchase, …).
     if (url.pathname === '/pixel' && request.method === 'POST') {
+      const rl = await rateLimit(env, request, 'pixel', 120, 60);
+      if (!rl.ok) return new Response(JSON.stringify({ ok: false }), { status: 429, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
       const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
       const event = String(body.event || 'unknown');
       const res = jsonResponse({ ok: true, event }, 200, origin);
@@ -4434,6 +5333,8 @@ export default {
       const slug = decodeURIComponent(url.pathname.slice('/reviews/'.length));
       if (request.method === 'GET') return handleReviews(env, slug, origin);
       if (request.method === 'POST') {
+        const rl = await rateLimit(env, request, 'review', 5, 3600);
+        if (!rl.ok) return jsonResponse({ ok: false, error: 'Too many reviews submitted.' }, 429, origin);
         const body = (await request.json().catch(() => ({}))) as { rating?: number; name?: string; body?: string };
         return handleSubmitReview(env, slug, body, origin);
       }
