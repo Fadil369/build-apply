@@ -7,7 +7,7 @@ export interface Env {
   EVIDENCE_BUCKET: R2Bucket;
   APPLICATIONS: KVNamespace;
   BUILD_DB: D1Database;
-  NOTION_TOKEN: string;
+  BURST_LIMIT: { limit(key: { key: string }): Promise<{ success: boolean }> };  NOTION_TOKEN: string;
   NOTION_BUILD_DB_ID: string;
   NOTION_COHORTS_DB_ID?: string;
   NOTION_SPRINTS_DB_ID?: string;
@@ -735,9 +735,9 @@ function jsonResponse(body: unknown, status = 200, origin: string | null = null)
 }
 
 /**
- * KV-backed rate limiter — abuse guard for public, side-effectful endpoints
- * (/apply spawns real GitHub repos; OTP requests cost money; /pixel writes D1).
- * Eventual consistency is acceptable: this is mitigation, not billing.
+ * Atomic rate limiter (D1 single-statement upsert — D1 serializes writes,
+ * so the read-modify-write race that defeated KV is impossible here).
+ * The BURST_LIMIT binding stays as an optional fast-path layer.
  */
 async function rateLimit(
   env: Env,
@@ -750,19 +750,25 @@ async function rateLimit(
     request.headers.get('cf-connecting-ip') ||
     request.headers.get('x-forwarded-for')?.split(',')[0].trim() ||
     'unknown';
-  const key = `rl:${bucket}:${ip}`;
+  try {
+    const burst = await env.BURST_LIMIT.limit({ key: `${bucket}:${ip}` });
+    if (!burst.success) return { ok: false, retryAfter: 60 };
+  } catch { /* optional layer */ }
+
   const now = Math.floor(Date.now() / 1000);
   try {
-    const raw = await env.APPLICATIONS.get(key);
-    let entry: { c: number; w: number } = { c: 0, w: now };
-    if (raw) {
-      try { entry = JSON.parse(raw); } catch { /* reset below */ }
-    }
-    if (now - entry.w >= windowSec) entry = { c: 0, w: now };
-    entry.c += 1;
-    await env.APPLICATIONS.put(key, JSON.stringify(entry), { expirationTtl: windowSec + 5 });
-    if (entry.c > max) {
-      return { ok: false, retryAfter: Math.max(1, windowSec - (now - entry.w)) };
+    const res = await env.BUILD_DB.prepare(
+      `INSERT INTO rl_counters (k, w, c) VALUES (?1, ?2, 1)
+       ON CONFLICT(k) DO UPDATE SET
+         c = CASE WHEN ?2 - w >= ?4 THEN 1 ELSE c + 1 END,
+         w = CASE WHEN ?2 - w >= ?4 THEN ?2 ELSE w END
+       RETURNING c`,
+    )
+      .bind(`rl:${bucket}:${ip}`, now, max, windowSec)
+      .first<{ c: number }>();
+    const count = res?.c ?? 1;
+    if (count > max) {
+      return { ok: false, retryAfter: Math.max(1, windowSec - (now % windowSec)) };
     }
     return { ok: true };
   } catch {

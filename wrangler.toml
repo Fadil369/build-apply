@@ -48,3 +48,9 @@ enabled = true
 #   a repo from Fadil369/brainsait-build-starter per paid candidate and invites
 #   them as a repo-scoped collaborator. No-ops until a "GitHub Username" field
 #   exists on the Notion candidate record. Token scope needed: repo.)
+
+# Atomic edge rate limiting (burst guard) — complements KV long-window caps
+[[ratelimits]]
+name = "BURST_LIMIT"
+namespace_id = "1001"
+simple = { limit = 15, period = 60 }
