@@ -104,6 +104,9 @@ interface ApplyPayload {
   evidenceFile?: { name: string; type: string; base64: string } | null;
   /** Installment plan: 'full' (one payment) | 'flex' (2×50%) | 'split' (3 payments). */
   plan?: string;
+  /** 'care' selects the free BUILD-CARE healthcare-worker ticket (requires
+   *  `profession`); anything else (or omitted) is the paid Standard ticket. */
+  ticketType?: 'standard' | 'care';
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -641,6 +644,19 @@ const TIERS: Record<string, PricingTier> = {
     price: BASE_PRICE,
     icon: '📋',
   },
+  // BUILD-CARE — free ticket for self-declared healthcare workers building
+  // healthcare apps. Deliberately excludes deployment support, the
+  // marketing/delivery phase, and 1:1 mentorship — those stay exclusive to
+  // the paid Standard Build Ticket. Routed through Shopify at SAR 0 (product
+  // handle `build-care`) so it still produces a real order for tracking.
+  care: {
+    id: 'care',
+    titleEn: 'BUILD-CARE — Healthcare Builder Ticket',
+    titleAr: 'تذكرة BUILD-CARE — لبناة الرعاية الصحية',
+    discount: 100,
+    price: 0,
+    icon: '🩺',
+  },
 };
 
 // FLAT launch pricing: all applicants are charged the single 9,630 SAR
@@ -666,6 +682,12 @@ const INSTALLMENT_VARIANTS: Record<string, string> = {
   split: '45982004576339',
   quarter: '45982004609107',
 };
+
+// BUILD-CARE — free healthcare-worker ticket. Own Shopify product/variant
+// (handle `build-care`, SAR 0.00) so free applications still create a real,
+// trackable Shopify order via normal checkout (no payment step needed at a
+// SAR 0 total). Created 2026-08-22.
+const CARE_VARIANT_ID = '46012254355539';
 
 const FOUNDER_OS_TRACKS: Record<string, { name: string; url: string }> = {
   standard: { name: 'Founder Accelerator', url: 'https://app.notion.com/p/3ba3479c6f62812aafb8e61f1e0eea75' },
@@ -873,8 +895,15 @@ function tierLabel(v: string): string {
     warrior_35: 'WARRIOR_35',
     academic_30: 'ACADEMIC_30',
     standard: 'STANDARD',
+    care: 'CARE',
   };
   return map[v] || v.toUpperCase();
+}
+
+/** True for both the KV-stored eligibilityId ('care') and the Notion
+ *  'Eligibility Tier' select label (tierLabel('care') === 'CARE'). */
+function isCareTier(v?: string | null): boolean {
+  return v === 'care' || v === 'CARE';
 }
 
 async function createNotionPage(
@@ -968,20 +997,35 @@ async function sendConfirmationEmail(
   if (!env.RESEND_API_KEY || !payload.email) return;
 
   const ar = payload.lang === 'ar';
+  const isCare = pricing.eligibilityId === 'care';
   const tierTitle = ar ? pricing.tier.titleAr : pricing.tier.titleEn;
-  const priceText = `${pricing.finalPrice.toLocaleString(ar ? 'ar-SA' : 'en-SA')} SAR`;
+  const priceText = isCare ? (ar ? 'مجانًا' : 'Free') : `${pricing.finalPrice.toLocaleString(ar ? 'ar-SA' : 'en-SA')} SAR`;
   const promoLine = pricing.promoCode
     ? ar
       ? `<li><strong>رمز الخصم المطبق:</strong> ${pricing.promoCode} — خصم ${pricing.discount}%</li>`
       : `<li><strong>Promo applied:</strong> ${pricing.promoCode} — ${pricing.discount}% off</li>`
     : '';
-  const originalLine = ar
-    ? `<li><strong>السعر الأصلي:</strong> ${ORIGINAL_PRICE.toLocaleString('ar-SA')} SAR — عرض الإطلاق لفترة محدودة</li>`
-    : `<li><strong>Original price:</strong> ${ORIGINAL_PRICE.toLocaleString('en-SA')} SAR — limited-time launch offer</li>`;
+  // BUILD-CARE is its own free product, not a discounted Standard ticket —
+  // skip the "was 14,960 SAR" launch-offer line, which doesn't apply to it.
+  const originalLine = isCare
+    ? ''
+    : ar
+      ? `<li><strong>السعر الأصلي:</strong> ${ORIGINAL_PRICE.toLocaleString('ar-SA')} SAR — عرض الإطلاق لفترة محدودة</li>`
+      : `<li><strong>Original price:</strong> ${ORIGINAL_PRICE.toLocaleString('en-SA')} SAR — limited-time launch offer</li>`;
+  const checkoutLabel = isCare ? (ar ? 'تأكيد المقعد المجاني' : 'Confirm your free seat') : (ar ? 'إتمام الدفع' : 'Complete payment');
+  const afterLine = isCare
+    ? ar
+      ? 'بعد تأكيد الطلب المجاني يُفتح حسابك، وصفحة الإعداد في Notion، ومستودع GitHub الخاص بك — للبناء فقط، بدون دعم نشر أو تسويق أو جلسات فردية.'
+      : "After you confirm the free order your customer account, Notion onboarding, and your own GitHub repo are provisioned — build-only access, with no deployment support, marketing phase, or 1:1 sessions."
+    : ar
+      ? 'بعد الدفع يُفتح حسابك، وصفحة الإعداد في Notion، ومستودع GitHub الخاص بك تلقائياً — ثم يرافقك بوت Forge: <a href="' + FORGE_BOT_URL + '" style="color:#8a6d1f;">@brainsait_forge_bot</a>.'
+      : 'After payment your customer account, Notion onboarding, and your own GitHub repo are provisioned automatically.';
 
-  const subject = ar
-    ? 'تم استلام طلبك في برنامج احتضان BrainSAIT'
-    : 'Your BrainSAIT Incubation Application Was Received';
+  const subject = isCare
+    ? (ar ? 'تم استلام طلبك في BUILD-CARE' : 'Your BUILD-CARE Application Was Received')
+    : ar
+      ? 'تم استلام طلبك في برنامج احتضان BrainSAIT'
+      : 'Your BrainSAIT Incubation Application Was Received';
 
   const html = ar
     ? luxuryEmailShell(subject, `
@@ -995,8 +1039,8 @@ async function sendConfirmationEmail(
           ${promoLine}
         </ul>
         <p style="margin:1rem 0;"><a href="${SMART_MATCHER_URL}" style="color:#8a6d1f;">اكتشف مسارك الأمثل عبر Smart Program Matcher ←</a></p>
-        ${checkoutUrl ? `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:14px 34px;"><a href="${checkoutUrl}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:15px;">إتمام الدفع</a></td></tr></table>` : ''}
-        <p style="margin:1rem 0 0;color:#666;font-size:0.9rem;">بعد الدفع يُفتح حسابك، وصفحة الإعداد في Notion، ومستودع GitHub الخاص بك تلقائياً — ثم يرافقك بوت Forge: <a href="${FORGE_BOT_URL}" style="color:#8a6d1f;">@brainsait_forge_bot</a>.</p>
+        ${checkoutUrl ? `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:14px 34px;"><a href="${checkoutUrl}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:15px;">${checkoutLabel}</a></td></tr></table>` : ''}
+        <p style="margin:1rem 0 0;color:#666;font-size:0.9rem;">${afterLine}</p>
         ${notionUrl ? `<p style="color:#666;font-size:0.9rem;">تابع حالة طلبك في Notion: <a href="${notionUrl}">${notionUrl}</a></p>` : ''}
       `, '', 'ar')
     : `<div style="font-family:system-ui,sans-serif;max-width:600px;margin:0 auto;line-height:1.6;">
@@ -1010,8 +1054,8 @@ async function sendConfirmationEmail(
           ${promoLine}
         </ul>
         <p style="margin:1rem 0;"><a href="${SMART_MATCHER_URL}">Find your best path with the Smart Program Matcher →</a></p>
-        ${checkoutUrl ? `<p style="margin:1.5rem 0;"><a href="${checkoutUrl}" style="background:#e9c46a;color:#131320;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:700;">Complete payment</a></p>` : ''}
-        <p style="margin:1rem 0 0;color:#666;font-size:0.9rem;">After payment your customer account, Notion onboarding, and your own GitHub repo are provisioned automatically.</p>
+        ${checkoutUrl ? `<p style="margin:1.5rem 0;"><a href="${checkoutUrl}" style="background:#e9c46a;color:#131320;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:700;">${checkoutLabel}</a></p>` : ''}
+        <p style="margin:1rem 0 0;color:#666;font-size:0.9rem;">${afterLine}</p>
         ${notionUrl ? `<p style="color:#666;font-size:0.9rem;">Track your application in Notion: <a href="${notionUrl}">${notionUrl}</a></p>` : ''}
       </div>`;
 
@@ -1124,6 +1168,19 @@ const MILESTONE_TEMPLATE: { name: string; automation: 'Auto' | 'Manual'; day: nu
   { name: '🏗️ المشروع الختامي — المنظومة المتكاملة', automation: 'Auto', day: 15 },
 ];
 
+// BUILD-CARE curriculum — build-only, deliberately shorter than the paid
+// 16-day track. Drops deployment/integration (paid day 3), launch (day 5),
+// market channels (day 6), and every 1:1/marketing-adjacent milestone; keeps
+// ignition, definition, identity/build, and validation, then a lightweight
+// wrap-up in place of the paid graduation & pitch day.
+const CARE_MILESTONE_TEMPLATE: { name: string; automation: 'Auto' | 'Manual'; day: number }[] = [
+  { name: '🔥 اليوم 0 · الإشعال — اختيار فكرة صحية', automation: 'Manual', day: 0 },
+  { name: '🎯 اليوم 1 · التحديد — المستخدم والمشكلة الصحية', automation: 'Manual', day: 1 },
+  { name: '🏗️ اليوم 2 · البناء — نموذج أولي للتطبيق', automation: 'Manual', day: 2 },
+  { name: '🧪 اليوم 3 · التحقق — تجربة مع مستخدمين حقيقيين', automation: 'Manual', day: 3 },
+  { name: '✅ الإنجاز — إتمام تذكرة BUILD-CARE', automation: 'Auto', day: 4 },
+];
+
 const GITHUB_TEMPLATE_OWNER = 'Fadil369';
 const GITHUB_TEMPLATE_REPO = 'brainsait-build-starter';
 
@@ -1215,10 +1272,13 @@ async function milestoneExists(env: Env, candidateId: string, name: string): Pro
   } catch { return true; /* fail-safe: don't duplicate blindly */ }
 }
 
-/** Seed the full 16-milestone curriculum for a candidate (idempotent). */
-async function seedMilestones(env: Env, candidateId: string): Promise<void> {
+/** Seed the milestone curriculum for a candidate (idempotent). Healthcare
+ *  BUILD-CARE candidates (tier 'care'/'CARE') get the shorter build-only
+ *  CARE_MILESTONE_TEMPLATE; everyone else gets the full 16-day track. */
+async function seedMilestones(env: Env, candidateId: string, tier?: string): Promise<void> {
   if (!env.NOTION_MILESTONES_DB_ID) return;
-  for (const m of MILESTONE_TEMPLATE) {
+  const template = isCareTier(tier) ? CARE_MILESTONE_TEMPLATE : MILESTONE_TEMPLATE;
+  for (const m of template) {
     if (await milestoneExists(env, candidateId, m.name)) continue;
     try {
       await notionRequest(env, 'POST', '/pages', {
@@ -2138,9 +2198,9 @@ async function provisionPaidApplication(env: Env, order: any, appRef: string, or
     // having already been marked Paid moments earlier. No single sub-system
     // gets to block the rest of a paid candidate's processing again.
     try { await createOnboardingPlan(env, candidate.id, payload); } catch (err) { console.error(`createOnboardingPlan failed for ${appRef}: ${err}`); }
-    // Paid candidates get the full 16-milestone curriculum seeded so the
-    // certification system has a real target to track.
-    try { await seedMilestones(env, candidate.id); } catch { /* best-effort */ }
+    // Paid candidates get the full 16-milestone curriculum seeded; BUILD-CARE
+    // candidates get the shorter build-only track (see seedMilestones).
+    try { await seedMilestones(env, candidate.id, candidate.properties['Eligibility Tier']?.select?.name); } catch { /* best-effort */ }
     try { await updateProgressOnApplication(env, candidate.id); } catch (err) { console.error(`updateProgressOnApplication failed for ${appRef}: ${err}`); }
   }
 
@@ -4761,10 +4821,17 @@ async function handleApply(request: Request, env: Env): Promise<Response> {
     if (!validateEmail(payload.email)) {
       return jsonResponse({ ok: false, error: 'Invalid email address' }, 400, origin);
     }
-    // Tiers were cancelled in 2026-08: every seat is the flat standard
+    // Tiers were cancelled in 2026-08: every paid seat is the flat standard
     // ticket. Identity is no longer collected by the storefront — default
-    // it so legacy data and cohort routing still work.
+    // it so legacy data and cohort routing still work. BUILD-CARE (added
+    // 2026-08-22) is the one deliberate exception: a free ticket gated on a
+    // self-declared healthcare profession, with no installment plan and no
+    // deployment/marketing/1:1 provisioning.
     payload.identity = payload.identity || 'OTHER';
+    const isCare = payload.ticketType === 'care';
+    if (isCare && !payload.profession) {
+      return jsonResponse({ ok: false, error: 'Missing required field: profession (self-declared healthcare role)' }, 400, origin);
+    }
 
     if (env.TURNSTILE_SECRET) {
       if (!payload.turnstileToken) {
@@ -4787,13 +4854,18 @@ async function handleApply(request: Request, env: Env): Promise<Response> {
       }
     }
 
-    const pricing = calculatePrice(
-      {
-        identity: payload.identity,
-        profession: payload.profession,
-      },
-      payload.promoCode
-    );
+    // BUILD-CARE is always free — skip promo codes and the standard
+    // eligibility/discount logic entirely rather than routing SAR 0 through
+    // calculatePrice's launch-price math.
+    const pricing: PricingResult = isCare
+      ? { tier: TIERS.care, eligibilityId: 'care', discount: 100, originalPrice: 0, finalPrice: 0, savings: 0, promoCode: undefined }
+      : calculatePrice(
+          {
+            identity: payload.identity,
+            profession: payload.profession,
+          },
+          payload.promoCode
+        );
 
     const track = FOUNDER_OS_TRACKS[pricing.eligibilityId] || FOUNDER_OS_TRACKS.standard;
     const appRef = crypto.randomUUID();
@@ -4913,47 +4985,65 @@ async function handleApply(request: Request, env: Env): Promise<Response> {
     });
 
     let checkoutUrl: string | undefined;
-    const planName = (payload.plan === 'flex' || payload.plan === 'split' || payload.plan === 'quarter') ? payload.plan : 'full';
-    const installmentPlan = buildInstallmentSchedule(appRef, payload.email, payload.fullName, payload.phone, planName, pricing.finalPrice, new Date(), payload.lang === 'ar' ? 'ar' : 'en');
-    await saveInstallmentPlan(env, installmentPlan);
-    // Broadcast the plan creation so the ecosystem knows (Notion, Airtable,
-    // hub/Telegram/SMS/n8n, KB). Skip for full-payment (single 9,630).
-    if (planName !== 'full') {
-      try { await broadcastInstallment(env, installmentPlan, 'created'); } catch { /* best-effort */ }
-    }
+    let planName = (payload.plan === 'flex' || payload.plan === 'split' || payload.plan === 'quarter') ? payload.plan : 'full';
+    let installmentPlan: InstallmentPlan | null = null;
 
-    if (pricing.finalPrice > 0) {
-      // Route the FIRST payment to the plan-specific product page so the cart
-      // charges the exact installment amount (not the full 9,630 ticket).
-      const variantId = INSTALLMENT_VARIANTS[planName] || INSTALLMENT_VARIANTS.full;
-      const firstAmount = installmentPlan.installments[0].amount;
+    if (isCare) {
+      // BUILD-CARE has no installments — one free ticket, one Shopify order
+      // at SAR 0 (product handle `build-care`) so it still shows up in
+      // order history/customer accounts like a paid ticket. No promo codes.
+      planName = 'care';
       const shop = env.SHOPIFY_STORE_DOMAIN || 'store.brainsait.org';
       const params = new URLSearchParams();
-      params.set('id', variantId);
+      params.set('id', CARE_VARIANT_ID);
       params.set('quantity', '1');
-      params.set('properties[eligibility_tier]', pricing.eligibilityId);
-      params.set('properties[discount_percent]', String(pricing.discount));
-      params.set('properties[final_price]', String(pricing.finalPrice));
-      params.set('properties[installment_amount]', String(firstAmount));
-      params.set('properties[installment_plan]', planName);
+      params.set('properties[eligibility_tier]', 'care');
+      params.set('properties[healthcare_profession]', payload.profession || '');
       params.set('properties[application_ref]', appRef);
       params.set('properties[applicant_email]', payload.email);
-      params.set('properties[installment_no]', '1');
-      params.set('properties[installment_ref]', `inst-${appRef}-1`);
-      if (pricing.promoCode) {
-        params.set('properties[promo_code]', pricing.promoCode);
+      checkoutUrl = `https://${shop}/cart/add?${params.toString()}`;
+    } else {
+      installmentPlan = buildInstallmentSchedule(appRef, payload.email, payload.fullName, payload.phone, planName, pricing.finalPrice, new Date(), payload.lang === 'ar' ? 'ar' : 'en');
+      await saveInstallmentPlan(env, installmentPlan);
+      // Broadcast the plan creation so the ecosystem knows (Notion, Airtable,
+      // hub/Telegram/SMS/n8n, KB). Skip for full-payment (single 9,630).
+      if (planName !== 'full') {
+        try { await broadcastInstallment(env, installmentPlan, 'created'); } catch { /* best-effort */ }
       }
-      // Promo codes are applied through Shopify's /discount/CODE flow, which
-      // pre-applies the code to the session cart and redirects to the store.
-      // The discount lands on the session cart (verified live: LAUNCH10 ->
-      // 8,667 SAR, FOUNDER15 -> 8,185.50 SAR) and the properties above are
-      // preserved when the customer proceeds to checkout.
-      if (pricing.promoCode) {
-        const code = encodeURIComponent(pricing.promoCode);
-        const add = `https://${shop}/cart/add?${params.toString()}`;
-        checkoutUrl = `https://${shop}/discount/${code}?redirect=${encodeURIComponent(add)}`;
-      } else {
-        checkoutUrl = `https://${shop}/cart/add?${params.toString()}`;
+
+      if (pricing.finalPrice > 0) {
+        // Route the FIRST payment to the plan-specific product page so the cart
+        // charges the exact installment amount (not the full 9,630 ticket).
+        const variantId = INSTALLMENT_VARIANTS[planName] || INSTALLMENT_VARIANTS.full;
+        const firstAmount = installmentPlan.installments[0].amount;
+        const shop = env.SHOPIFY_STORE_DOMAIN || 'store.brainsait.org';
+        const params = new URLSearchParams();
+        params.set('id', variantId);
+        params.set('quantity', '1');
+        params.set('properties[eligibility_tier]', pricing.eligibilityId);
+        params.set('properties[discount_percent]', String(pricing.discount));
+        params.set('properties[final_price]', String(pricing.finalPrice));
+        params.set('properties[installment_amount]', String(firstAmount));
+        params.set('properties[installment_plan]', planName);
+        params.set('properties[application_ref]', appRef);
+        params.set('properties[applicant_email]', payload.email);
+        params.set('properties[installment_no]', '1');
+        params.set('properties[installment_ref]', `inst-${appRef}-1`);
+        if (pricing.promoCode) {
+          params.set('properties[promo_code]', pricing.promoCode);
+        }
+        // Promo codes are applied through Shopify's /discount/CODE flow, which
+        // pre-applies the code to the session cart and redirects to the store.
+        // The discount lands on the session cart (verified live: LAUNCH10 ->
+        // 8,667 SAR, FOUNDER15 -> 8,185.50 SAR) and the properties above are
+        // preserved when the customer proceeds to checkout.
+        if (pricing.promoCode) {
+          const code = encodeURIComponent(pricing.promoCode);
+          const add = `https://${shop}/cart/add?${params.toString()}`;
+          checkoutUrl = `https://${shop}/discount/${code}?redirect=${encodeURIComponent(add)}`;
+        } else {
+          checkoutUrl = `https://${shop}/cart/add?${params.toString()}`;
+        }
       }
     }
 
@@ -4976,16 +5066,18 @@ async function handleApply(request: Request, env: Env): Promise<Response> {
         finalPrice: pricing.finalPrice,
         checkoutUrl,
         plan: planName,
-        installments: planName === 'full'
+        installments: !installmentPlan || planName === 'full'
           ? null
           : installmentPlan.installments.map((i) => ({
               no: i.no,
               label: i.label,
               amount: i.amount,
               dueAt: i.dueAt,
-              payUrl: i.no === 1 ? undefined : installmentPaymentUrl(env, appRef, installmentPlan, i.no),
+              payUrl: i.no === 1 ? undefined : installmentPaymentUrl(env, appRef, installmentPlan!, i.no),
             })),
-        message: pricing.finalPrice === 0
+        message: isCare
+          ? 'Application received — complete the SAR 0 checkout to confirm your BUILD-CARE seat.'
+          : pricing.finalPrice === 0
           ? 'Application received — your access is pending verification.'
           : 'Application received — complete payment to confirm your seat.',
       },
