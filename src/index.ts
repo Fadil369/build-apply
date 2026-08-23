@@ -2138,6 +2138,12 @@ async function provisionPaidApplication(env: Env, order: any, appRef: string, or
     return jsonResponse({ ok: false, error: 'Application not found' }, 404, origin);
   }
 
+  // BUILD-CARE is a free ticket — everything below was written before it
+  // existed and defaults to paid-partner treatment (SAR 500 gift card, B2B
+  // company, "Super Partner" tags/copy) for every provisioned application.
+  // Gate those paid-only perks on the actual tier instead of assuming standard.
+  const isCareTicket = isCareTier(candidate.kv ? candidate.kv.tier : candidate.properties['Eligibility Tier']?.select?.name);
+
   const appEmail = candidate.kv
     ? (candidate.kv.email || '').toLowerCase()
     : ((candidate.properties.Email?.email || '') as string).toLowerCase();
@@ -2260,13 +2266,15 @@ async function provisionPaidApplication(env: Env, order: any, appRef: string, or
       country: payload.country || '',
       applicationRef: appRef,
       acceptsMarketing: true,
-      tags: ['build-partner', 'super-partner', 'paid', 'partner-profile'],
+      tags: isCareTicket
+        ? ['build-care', 'care-partner', 'partner-profile']
+        : ['build-partner', 'super-partner', 'paid', 'partner-profile'],
     }, true);
   } catch { /* non-fatal */ }
 
   if (env.RESEND_API_KEY && payload.email) {
     try {
-      await sendPaidWelcomeEmail(env, payload.email, payload.fullName || 'Founder', appRef, buildClaimToken, buildOid, payload.lang === 'ar' ? 'ar' : 'en');
+      await sendPaidWelcomeEmail(env, payload.email, payload.fullName || 'Founder', appRef, buildClaimToken, buildOid, payload.lang === 'ar' ? 'ar' : 'en', isCareTicket);
     } catch { /* best-effort */ }
   }
 
@@ -2282,6 +2290,7 @@ async function provisionPaidApplication(env: Env, order: any, appRef: string, or
       appRef,
       githubUsername: githubUsername || '',
       lang: payload.lang === 'ar' ? 'ar' : 'en',
+      isCareTicket,
     });
   } catch (err) { console.error(`sendTelegramWelcome failed for ${appRef}: ${err}`); }
 
@@ -2298,6 +2307,7 @@ async function provisionPaidApplication(env: Env, order: any, appRef: string, or
         fullName: payload.fullName || 'Founder',
         appRef,
         phone: payload.phone || '',
+        isCareTicket,
       });
       superResults = prov.results || {};
     }
@@ -2313,7 +2323,7 @@ async function provisionPaidApplication(env: Env, order: any, appRef: string, or
         applicationId: appRef,
         email: orderEmail || payload.email,
         fullName: payload.fullName || 'Founder',
-        tier: 'STANDARD',
+        tier: isCareTicket ? 'CARE' : 'STANDARD',
         orderId: String(order.admin_graphql_api_id || order.id || ''),
         fulfillmentId: superResults.fulfillment?.fulfillmentId,
         giftCardId: superResults.giftCard?.giftCardId,
@@ -2332,7 +2342,7 @@ async function provisionPaidApplication(env: Env, order: any, appRef: string, or
       applicationId: appRef,
       email: orderEmail || payload.email || '',
       fullName: payload.fullName || 'Founder',
-      tier: 'STANDARD',
+      tier: isCareTicket ? 'CARE' : 'STANDARD',
       orderId: String(order.admin_graphql_api_id || order.id || ''),
       fulfillmentId: superResults.fulfillment?.fulfillmentId || '',
       giftCardId: superResults.giftCard?.giftCardId || '',
@@ -2366,7 +2376,7 @@ async function provisionPaidApplication(env: Env, order: any, appRef: string, or
       applicationId: appRef,
       email: orderEmail || payload.email || '',
       fullName: payload.fullName || 'Founder',
-      tier: 'STANDARD',
+      tier: isCareTicket ? 'CARE' : 'STANDARD',
       orderId: String(order.admin_graphql_api_id || order.id || ''),
       fulfillmentId: superResults.fulfillment?.fulfillmentId || '',
       giftCardId: superResults.giftCard?.giftCardId || '',
@@ -2389,8 +2399,8 @@ async function provisionPaidApplication(env: Env, order: any, appRef: string, or
         ? candidate.kv.githubUsername
         : candidate?.properties?.['GitHub Username']?.rich_text?.[0]?.plain_text || '',
       appRef,
-      tier: 'STANDARD',
-      finalPrice: 9630,
+      tier: isCareTicket ? 'CARE' : 'STANDARD',
+      finalPrice: isCareTicket ? 0 : 9630,
       paymentStatus: 'Paid',
       applicationStatus: 'Approved',
       track: 'Founder Accelerator',
@@ -2409,6 +2419,7 @@ async function sendPaidWelcomeEmail(
   claimToken?: string,
   oid?: string,
   lang: 'ar' | 'en' = 'en',
+  isCare = false,
 ): Promise<void> {
   const ar = lang === 'ar';
   const trackUrl = `${BUILD_TRACK_URL}?ref=${encodeURIComponent(appRef)}`;
@@ -2419,7 +2430,58 @@ async function sendPaidWelcomeEmail(
 
   let body: string;
   let subject: string;
-  if (ar) {
+  // BUILD-CARE is a free, build-only ticket: no "payment"/"partner" framing,
+  // no Founder OS / Second Brain / Forge bot upsells, no 1:1 evaluation offer
+  // (explicitly excluded, see TIERS.care), and 5 milestones — not 16.
+  if (isCare) {
+    if (ar) {
+      subject = '🎉 مقعدك في BUILD-CARE مؤكّد — لنبدأ البناء';
+      body = `
+        <p style="margin:0 0 14px;font-size:17px;color:#131320;"><b>🎉 أهلاً بك، ${escapeHtml(name)}</b></p>
+        <p style="margin:0 0 16px;">تم تأكيد مقعدك المجاني في BUILD-CARE. مسارك مباشر وبناء فقط — ٥ محطّات، بدون دعم نشر أو تسويق أو جلسات فردية.</p>
+        ${oidLine}
+        <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:14px 34px;">
+          <a href="${accountUrl}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:15px;">افتح حسابي 🪪</a>
+        </td></tr></table>
+        <p style="margin:0 0 10px;color:#131320;"><b>🧑‍💻 كل شيء أُعدّ لك تلقائياً</b> — منذ لحظة تأكيد طلبك:</p>
+        <ul style="margin:0 0 16px;padding-right:20px;color:#444;font-family:Arial,sans-serif;font-size:14px;line-height:1.8;">
+          <li><b>إعداد Notion</b> — صفحة طلبك ولوحة المحطّات مفعّلة، وجميع محطّات BUILD-CARE الخمس مزروعة.</li>
+          <li><b>مستودع GitHub</b> — مستودعك الخاص المولّد من بداية BUILD، مع إضافتك كمتعاون (عند توفير اسم المستخدم عند التسجيل).</li>
+          <li><b>حساب العميل</b> — حسابك في Shopify موسوم كمشارك BUILD-CARE.</li>
+          <li><b>متابعة يومية</b> — مهمة تُنشأ لك كل يوم عمل؛ أنجزها من لوحة Notion أو من لوحة تحكّمك.</li>
+        </ul>
+        <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
+          <a href="${trackUrl}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">افتح لوحة تقدّمك ←</a>
+        </td></tr></table>
+        <p style="margin:0 0 10px;color:#131320;"><b>🏅 الشهادة والوسام</b> — عند إكمال محطّاتك الخمس تُصدر شهادتك ووسام Open Badge تلقائياً، وتظهر في ملفّك.</p>
+        <hr style="border:none;border-top:1px solid #e5ddc4;margin:20px 0;" />
+        <p style="margin:0;color:#666;font-size:13px;font-family:Arial,sans-serif;">الطلب <b>${appRef}</b> · حسابي: <a href="${accountUrl}" style="color:#8a6d1f;">${ACCOUNT_URL}</a> · لوحة التقدّم: <a href="${trackUrl}" style="color:#8a6d1f;">${trackUrl}</a></p>
+      `;
+    } else {
+      subject = "🎉 Your BUILD-CARE seat is confirmed — let's build";
+      body = `
+        <p style="margin:0 0 14px;font-size:17px;color:#131320;"><b>🎉 Welcome, ${escapeHtml(name)}</b></p>
+        <p style="margin:0 0 16px;">Your free BUILD-CARE seat is confirmed. Your track is build-only — 5 milestones, with no deployment support, marketing phase, or 1:1 sessions.</p>
+        ${oidLine}
+        <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:linear-gradient(135deg,#c9a227,#e9c46a);border-radius:999px;padding:14px 34px;">
+          <a href="${accountUrl}" style="color:#131320;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:15px;">Open My Account 🪪</a>
+        </td></tr></table>
+        <p style="margin:0 0 10px;color:#131320;"><b>🧑‍💻 Everything is already set up for you</b> — all automated the moment your free order was confirmed:</p>
+        <ul style="margin:0 0 16px;padding-left:20px;color:#444;font-family:Arial,sans-serif;font-size:14px;line-height:1.8;">
+          <li><b>Notion onboarding</b> — your application page and milestone board are live, all 5 BUILD-CARE milestones seeded.</li>
+          <li><b>GitHub repo</b> — your own repository generated from the BUILD starter, with you added as a collaborator (when a GitHub username was provided at intake).</li>
+          <li><b>Customer account</b> — your Shopify customer account is tagged as a BUILD-CARE participant.</li>
+          <li><b>Daily standups</b> — a task is created for you every working day; complete it on your Notion board or from your dashboard.</li>
+        </ul>
+        <table role="presentation" cellpadding="0" cellspacing="0" style="margin:16px auto;"><tr><td style="background:#131320;border-radius:999px;padding:13px 30px;">
+          <a href="${trackUrl}" style="color:#e9c46a;text-decoration:none;font-weight:700;font-family:Arial,sans-serif;font-size:14px;">Open your progress dashboard →</a>
+        </td></tr></table>
+        <p style="margin:0 0 10px;color:#131320;"><b>🏅 Certificate & badge</b> — on completing your 5 milestones your certificate and Open Badge are issued automatically and shown on your profile.</p>
+        <hr style="border:none;border-top:1px solid #e5ddc4;margin:20px 0;" />
+        <p style="margin:0;color:#666;font-size:13px;font-family:Arial,sans-serif;">Application <b>${appRef}</b> · My Account: <a href="${accountUrl}" style="color:#8a6d1f;">${ACCOUNT_URL}</a> · Progress dashboard: <a href="${trackUrl}" style="color:#8a6d1f;">${trackUrl}</a></p>
+      `;
+    }
+  } else if (ar) {
     subject = '🎉 تم تفعيل مقعد الشراكة في BrainSAIT — دماغك الثاني بين يديك';
     body = `
       <p style="margin:0 0 14px;font-size:17px;color:#131320;"><b>🎉 أهلاً بك، ${escapeHtml(name)}</b></p>
@@ -2552,34 +2614,54 @@ async function sendTelegramWelcome(env: Env, opts: {
   appRef: string;
   githubUsername?: string;
   lang?: 'ar' | 'en';
+  isCareTicket?: boolean;
 }): Promise<void> {
   if (!env.TELEGRAM_BOT_TOKEN || !opts.telegramId) return;
   const ar = opts.lang === 'ar';
   const trackUrl = `${BUILD_TRACK_URL}?ref=${encodeURIComponent(opts.appRef)}`;
   const repoName = `build-${opts.appRef.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 60)}`;
-  const lines = ar
-    ? [
-        `🎉 <b>أهلاً بك، ${escapeHtml(opts.fullName)}</b> — مقعدك في BUILD مُفعّل الآن!`,
-        `✅ تم تأكيد الدفع · شريك Super`,
-        `🚀 دورة Founder OS: ${FOUNDER_OS_URL}`,
-        `🧠 دماغك الثاني (BUILD): ${ULTIMATE_BRAIN_BUILD_URL}`,
-        `🤖 بوت المتابعة: ${FORGE_BOT_URL}`,
-        opts.githubUsername ? `🐙 مستودعك على GitHub: ${GITHUB_PROFILE_URL}/${GITHUB_TEMPLATE_OWNER}/${repoName}` : '',
-        `📊 تابع محطّاتك الـ١٦: ${trackUrl}`,
-        env.TELEGRAM_COHORT_LINK ? `👥 المجموعة: ${env.TELEGRAM_COHORT_LINK}` : '',
-        `📅 تعديل الخطة أو الخصم: ${CALENDAR_URL}`,
-      ]
-    : [
-        `🎉 <b>Welcome, ${escapeHtml(opts.fullName)}</b> — your BUILD seat is ACTIVE!`,
-        `✅ Payment confirmed · Super Partner`,
-        `🚀 Founder OS course: ${FOUNDER_OS_URL}`,
-        `🧠 Your 2nd Brain (BUILD): ${ULTIMATE_BRAIN_BUILD_URL}`,
-        `🤖 Follow-up bot: ${FORGE_BOT_URL}`,
-        opts.githubUsername ? `🐙 Your GitHub repo: ${GITHUB_PROFILE_URL}/${GITHUB_TEMPLATE_OWNER}/${repoName}` : '',
-        `📊 Track your 16 milestones: ${trackUrl}`,
-        env.TELEGRAM_COHORT_LINK ? `👥 Cohort: ${env.TELEGRAM_COHORT_LINK}` : '',
-        `📅 Adjust plan or discount: ${CALENDAR_URL}`,
-      ];
+  // BUILD-CARE is free/build-only: no "Super Partner"/"payment" framing, no
+  // Founder OS / 2nd Brain / Forge bot upsells, no 1:1 discount-call offer,
+  // and 5 milestones — not 16.
+  const lines = opts.isCareTicket
+    ? (ar
+      ? [
+          `🎉 <b>أهلاً بك، ${escapeHtml(opts.fullName)}</b> — مقعدك في BUILD-CARE مُفعّل الآن!`,
+          `✅ تم تأكيد طلبك المجاني`,
+          opts.githubUsername ? `🐙 مستودعك على GitHub: ${GITHUB_PROFILE_URL}/${GITHUB_TEMPLATE_OWNER}/${repoName}` : '',
+          `📊 تابع محطّاتك الخمس: ${trackUrl}`,
+          env.TELEGRAM_COHORT_LINK ? `👥 المجموعة: ${env.TELEGRAM_COHORT_LINK}` : '',
+        ]
+      : [
+          `🎉 <b>Welcome, ${escapeHtml(opts.fullName)}</b> — your BUILD-CARE seat is ACTIVE!`,
+          `✅ Your free order is confirmed`,
+          opts.githubUsername ? `🐙 Your GitHub repo: ${GITHUB_PROFILE_URL}/${GITHUB_TEMPLATE_OWNER}/${repoName}` : '',
+          `📊 Track your 5 milestones: ${trackUrl}`,
+          env.TELEGRAM_COHORT_LINK ? `👥 Cohort: ${env.TELEGRAM_COHORT_LINK}` : '',
+        ])
+    : (ar
+      ? [
+          `🎉 <b>أهلاً بك، ${escapeHtml(opts.fullName)}</b> — مقعدك في BUILD مُفعّل الآن!`,
+          `✅ تم تأكيد الدفع · شريك Super`,
+          `🚀 دورة Founder OS: ${FOUNDER_OS_URL}`,
+          `🧠 دماغك الثاني (BUILD): ${ULTIMATE_BRAIN_BUILD_URL}`,
+          `🤖 بوت المتابعة: ${FORGE_BOT_URL}`,
+          opts.githubUsername ? `🐙 مستودعك على GitHub: ${GITHUB_PROFILE_URL}/${GITHUB_TEMPLATE_OWNER}/${repoName}` : '',
+          `📊 تابع محطّاتك الـ١٦: ${trackUrl}`,
+          env.TELEGRAM_COHORT_LINK ? `👥 المجموعة: ${env.TELEGRAM_COHORT_LINK}` : '',
+          `📅 تعديل الخطة أو الخصم: ${CALENDAR_URL}`,
+        ]
+      : [
+          `🎉 <b>Welcome, ${escapeHtml(opts.fullName)}</b> — your BUILD seat is ACTIVE!`,
+          `✅ Payment confirmed · Super Partner`,
+          `🚀 Founder OS course: ${FOUNDER_OS_URL}`,
+          `🧠 Your 2nd Brain (BUILD): ${ULTIMATE_BRAIN_BUILD_URL}`,
+          `🤖 Follow-up bot: ${FORGE_BOT_URL}`,
+          opts.githubUsername ? `🐙 Your GitHub repo: ${GITHUB_PROFILE_URL}/${GITHUB_TEMPLATE_OWNER}/${repoName}` : '',
+          `📊 Track your 16 milestones: ${trackUrl}`,
+          env.TELEGRAM_COHORT_LINK ? `👥 Cohort: ${env.TELEGRAM_COHORT_LINK}` : '',
+          `📅 Adjust plan or discount: ${CALENDAR_URL}`,
+        ]);
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -4371,17 +4453,17 @@ async function createBuildFulfillment(env: Env, input: { orderId: string; appRef
  * Tag the paid order as a BUILD partner order and append a provisioning note
  * so the store timeline records the Super-partner activation. Best-effort.
  */
-async function annotateBuildOrder(env: Env, input: { orderId: string; appRef: string; companyId?: string; giftCardId?: string }): Promise<{ ok: boolean; error?: string }> {
+async function annotateBuildOrder(env: Env, input: { orderId: string; appRef: string; companyId?: string; giftCardId?: string; isCareTicket?: boolean }): Promise<{ ok: boolean; error?: string }> {
   if (!env.SHOPIFY_ADMIN_TOKEN) return { ok: false, error: 'no admin token' };
   try {
-    const parts = ['Super-partner provisioning complete', `application_ref: ${input.appRef}`];
+    const parts = [input.isCareTicket ? 'BUILD-CARE provisioning complete' : 'Super-partner provisioning complete', `application_ref: ${input.appRef}`];
     if (input.companyId) parts.push(`company: ${input.companyId}`);
     if (input.giftCardId) parts.push(`gift_card: ${input.giftCardId}`);
     const res = await shopifyGraphQL(env, `mutation($id: ID!, $tags: [String!]!, $note: String!) {
       orderUpdate(input: { id: $id, tags: $tags, note: $note }) { order { id } userErrors { field message } }
     }`, {
       id: input.orderId,
-      tags: ['build-partner', 'super-provisioned'],
+      tags: input.isCareTicket ? ['build-care', 'care-provisioned'] : ['build-partner', 'super-provisioned'],
       note: parts.join(' · '),
     });
     const errs = res?.errors || res?.data?.orderUpdate?.userErrors || [];
@@ -4395,18 +4477,23 @@ async function annotateBuildOrder(env: Env, input: { orderId: string; appRef: st
 /**
  * Orchestrate the full "Super" partner provisioning for a paid BUILD order.
  * Everything is independently best-effort — no single failure blocks the rest.
+ * BUILD-CARE is a free ticket: it still gets its order marked fulfilled, but
+ * never the SAR 500 welcome gift card or B2B company account — those are
+ * paid-partner perks reserved for the Standard Build Ticket.
  */
-async function provisionSuperPartner(env: Env, input: { orderId: string; email: string; fullName?: string; appRef: string; phone?: string }): Promise<{ ok: boolean; results: Record<string, any> }> {
+async function provisionSuperPartner(env: Env, input: { orderId: string; email: string; fullName?: string; appRef: string; phone?: string; isCareTicket?: boolean }): Promise<{ ok: boolean; results: Record<string, any> }> {
   const results: Record<string, any> = {};
 
   // 1. Fulfillment record on the paid order.
   results.fulfillment = await createBuildFulfillment(env, { orderId: input.orderId, appRef: input.appRef, email: input.email });
 
-  // 2. Welcome gift card (SAR 500 store credit).
-  results.giftCard = await issueWelcomeGiftCard(env, { email: input.email, appRef: input.appRef, name: input.fullName });
+  if (!input.isCareTicket) {
+    // 2. Welcome gift card (SAR 500 store credit).
+    results.giftCard = await issueWelcomeGiftCard(env, { email: input.email, appRef: input.appRef, name: input.fullName });
 
-  // 3. B2B company record for the partner.
-  results.company = await createPartnerCompany(env, { email: input.email, fullName: input.fullName, appRef: input.appRef });
+    // 3. B2B company record for the partner.
+    results.company = await createPartnerCompany(env, { email: input.email, fullName: input.fullName, appRef: input.appRef });
+  }
 
   // 4. Tag the order + note the provisioning so the store timeline records it.
   results.annotation = await annotateBuildOrder(env, {
@@ -4414,6 +4501,7 @@ async function provisionSuperPartner(env: Env, input: { orderId: string; email: 
     appRef: input.appRef,
     companyId: results.company?.companyId,
     giftCardId: results.giftCard?.giftCardId,
+    isCareTicket: input.isCareTicket,
   });
 
   const ok = Object.values(results).every((r) => r?.ok === true || r?.idempotent === true);
