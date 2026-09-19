@@ -34,7 +34,7 @@ Central operations reference for the BUILD incubation ecosystem. Single source o
         └─────────────────┘  └──────────────────────────┘
         ┌─────────────────┐  ┌──────────────────────────┐
         │ Canva registry  │  │ Shopify app (extensions) │
-        │ hub.brainsait.de│  │ checkout·pixel·post-purchase│
+        │ hub.brainsait.org│  │ checkout·pixel·post-purchase│
         └─────────────────┘  └──────────────────────────┘
 ```
 
@@ -51,7 +51,7 @@ Central operations reference for the BUILD incubation ecosystem. Single source o
 | **R2** | `build-evidence` | Cloudflare R2 | Evidence files, certs, screenshot cache |
 | **KV** | `APPLICATIONS` (`20ed085e…`) | Cloudflare KV | Applications + certs + webhook dedup |
 | **n8n** | `127.0.0.1:5678` (podman) | n8n | Workflow automation (21 workflows) |
-| **Canva** | `hub.brainsait.de/canva` | Node backend | Design Registry (Airtable-backed) |
+| **Canva** | `hub.brainsait.org/canva` | Node backend | Design Registry (Airtable-backed) |
 | **Shopify app** | `app.brainsait.de` | Remix + extensions | Checkout UI, web pixel, post-purchase |
 | **KB** | hub MCP | vector store | 16-day curriculum embeddings |
 
